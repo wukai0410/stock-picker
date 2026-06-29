@@ -14,10 +14,8 @@ warnings.filterwarnings("ignore")
 # ============================================================
 from alphafeed import AlphaFeed
 
-# AlphaFeed Pro API Key
-ALPHAFEED_API_KEY = "sk_8d52237598264e3d9f5d95913fc9a404"
-
-af = AlphaFeed(api_key=ALPHAFEED_API_KEY)
+# 自动读取环境变量 ALPHAFEED_API_KEY（Streamlit Cloud 在 Settings → Secrets 中配置）
+af = AlphaFeed()
 
 # ============================================================
 # 时区工具
