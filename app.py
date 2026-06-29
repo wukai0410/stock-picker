@@ -63,52 +63,59 @@ def _get_column(df: pd.DataFrame, candidates: list) -> str | None:
     return None
 
 # ============================================================
-# 数据获取（缓存）
+# 数据获取（缓存 + 重试）
 # ============================================================
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_realtime_quotes():
-    """获取实时行情数据（带列名兼容性检查）"""
-    try:
-        df = ak.stock_zh_a_spot_em()
-        if df is None or df.empty:
-            return None
-        column_mapping = {
-            "代码": ["代码", "code", "股票代码"],
-            "名称": ["名称", "name", "股票名称"],
-            "涨跌幅": ["涨跌幅", "涨跌幅%", "change_pct", "涨幅"],
-            "量比": ["量比", "volume_ratio", "量比(当日)"],
-            "成交额": ["成交额", "amount", "成交金额"],
-            "换手率": ["换手率", "turnover", "换手率%"],
-            "最新价": ["最新价", "price", "收盘价", "现价"],
-        }
-        mapped_cols = {}
-        for std_name, aliases in column_mapping.items():
-            found = _get_column(df, aliases)
-            if found:
-                mapped_cols[found] = std_name
-        if mapped_cols:
-            df = df.rename(columns=mapped_cols)
-        required_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
-        missing = [c for c in required_cols if c not in df.columns]
-        if missing:
-            st.warning(f"⚠️ 数据源列名不匹配，缺失: {missing}。尝试自动适配...")
-            for col in df.columns:
-                for req in required_cols:
-                    if req in col or col in req:
-                        df = df.rename(columns={col: req})
-                        break
+    """获取实时行情数据（带重试和列名兼容性检查）"""
+    import time
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = ak.stock_zh_a_spot_em()
+            if df is None or df.empty:
+                time.sleep(1)
+                continue
+            column_mapping = {
+                "代码": ["代码", "code", "股票代码"],
+                "名称": ["名称", "name", "股票名称"],
+                "涨跌幅": ["涨跌幅", "涨跌幅%", "change_pct", "涨幅"],
+                "量比": ["量比", "volume_ratio", "量比(当日)"],
+                "成交额": ["成交额", "amount", "成交金额"],
+                "换手率": ["换手率", "turn_over", "换手率%"],
+                "最新价": ["最新价", "price", "收盘价", "现价"],
+            }
+            mapped_cols = {}
+            for std_name, aliases in column_mapping.items():
+                found = _get_column(df, aliases)
+                if found:
+                    mapped_cols[found] = std_name
+            if mapped_cols:
+                df = df.rename(columns=mapped_cols)
+            required_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
             missing = [c for c in required_cols if c not in df.columns]
             if missing:
-                st.error(f"❌ 无法识别必要列: {missing}，请检查 akshare 版本")
-                return None
-        numeric_cols = ["涨跌幅", "量比", "成交额", "换手率", "最新价"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df
-    except Exception as e:
-        st.error(f"获取实时行情失败: {e}")
-        return None
+                st.warning(f"⚠️ 数据源列名不匹配，缺失: {missing}。尝试自动适配...")
+                for col in df.columns:
+                    for req in required_cols:
+                        if req in col or col in req:
+                            df = df.rename(columns={col: req})
+                            break
+                missing = [c for c in required_cols if c not in df.columns]
+                if missing:
+                    st.error(f"❌ 无法识别必要列: {missing}，请检查 akshare 版本")
+                    return None
+            numeric_cols = ["涨跌幅", "量比", "成交额", "换手率", "最新价"]
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    st.error(f"获取实时行情失败（重试3次）: {last_err}")
+    return None
 
 @st.cache_data(ttl=60)
 def fetch_intraday_minute(symbol: str):
@@ -210,7 +217,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     status_text.text("⏳ 准备获取实时行情...")
     df = fetch_realtime_quotes()
     if df is None:
-        st.error("❌ 无法获取实时行情，请检查网络或稍后重试")
+        st.error("❌ 无法获取实时行情，请检查网络或稍后重试（建议点击「清除缓存并刷新」）")
         return None
     config = get_config()
     total = len(df)
@@ -391,7 +398,6 @@ def render_yesterday_review():
         else:
             st.info("📊 今日与昨日无重叠股票，市场风格可能切换")
 
-
 # ============================================================
 # Streamlit 主页面
 # ============================================================
@@ -466,17 +472,6 @@ if df_result is not None and not df_result.empty:
         st.caption(f"⏱️ 缓存时间戳：{cached_ts}")
     st.dataframe(
         df_result,
-        column_config={
-            "代码": st.column_config.TextColumn("代码", width="small"),
-            "名称": st.column_config.TextColumn("名称", width="medium"),
-            "涨跌幅%": st.column_config.NumberColumn("涨跌幅%", format="%.2f%%"),
-            "量比": st.column_config.NumberColumn("量比", format="%.2f"),
-            "换手率%": st.column_config.NumberColumn("换手率%", format="%.2f%%"),
-            "成交额亿": st.column_config.NumberColumn("成交额亿", format="%.2f"),
-            "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
-            "抢筹": st.column_config.TextColumn("抢筹", width="medium"),
-            "抢筹评分": st.column_config.NumberColumn("抢筹评分", format="%.1f"),
-        },
         use_container_width=True,
         hide_index=True,
     )
