@@ -13,9 +13,11 @@ warnings.filterwarnings("ignore")
 # AlphaFeed 导入和初始化（Pro 版）
 # ============================================================
 from alphafeed import AlphaFeed
+import os
 
-# 自动读取环境变量 ALPHAFEED_API_KEY（Streamlit Cloud 在 Settings → Secrets 中配置）
-af = AlphaFeed()
+# 优先环境变量（Streamlit Cloud Secrets），本机兜底硬编码
+_af_key = os.environ.get("ALPHAFEED_API_KEY", "sk_8d52237598264e3d9f5d95913fc9a404")
+af = AlphaFeed(api_key=_af_key)
 
 # ============================================================
 # 时区工具
@@ -916,9 +918,9 @@ def main_page():
     st.title("📈 尾盘智能选股工具")
     st.caption("基于 AlphaFeed Pro 数据源 + 综合评分系统 + 主力分析")
 
-    # AlphaFeed 健康检查
+    # AlphaFeed 健康检查（新版SDK无limit参数，用symbols单只股票测试）
     try:
-        test = af.quotes.get(universes="CN_Stock", limit=1)
+        test = af.quotes.get(symbols="600000.SH")
         if not test:
             st.error("❌ AlphaFeed 连接失败，请检查 API Key 和网络")
             st.stop()
