@@ -566,8 +566,8 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
 
             if not (config["pct_min"] < chg < config["pct_max"]):
                 continue
-            # 量比筛选暂时放宽，有数据才过滤
-            if vol_ratio > 0 and vol_ratio < config["vol_ratio_min"]:
+            # 量比筛选：默认值1.0表示无真实数据，放行；有真实数据才严格过滤
+            if vol_ratio != 1.0 and vol_ratio < config["vol_ratio_min"]:
                 continue
             if not (config["turnover_min"] < turnover < config["turnover_max"]):
                 continue
