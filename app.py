@@ -287,12 +287,23 @@ def get_fund_flow_summary(symbol: str) -> dict:
 # ============================================================
 def calc_composite_score(vol_ratio: float, turnover: float, pct: float, close: float, ma20: float | None) -> int:
     score = 0
-    if vol_ratio >= 2.5:
-        score += 30
-    elif vol_ratio >= 2.0:
-        score += 20
+
+    # 量比/换手率评分（量比缺失时用换手率替代）
+    if vol_ratio > 1.0:
+        if vol_ratio >= 2.5:
+            score += 30
+        elif vol_ratio >= 2.0:
+            score += 20
+        else:
+            score += 10
     else:
-        score += 10
+        if turnover >= 10:
+            score += 30
+        elif turnover >= 8:
+            score += 20
+        elif turnover >= 5:
+            score += 10
+
     if 5 <= turnover <= 8:
         score += 25
     elif 3 <= turnover <= 10:
@@ -311,9 +322,17 @@ def calc_composite_score(vol_ratio: float, turnover: float, pct: float, close: f
 
 
 def analyze_main_force_stage(vol_ratio: float, pct: float, turnover: float, close: float, ma20: float | None) -> dict:
-    is_high_volume = vol_ratio >= 2.0
+    # 放量判断：优先用真实量比，量比缺失时用换手率替代（>5%视为活跃，>8%视为放量）
+    if vol_ratio > 1.0:
+        is_high_volume = vol_ratio >= 2.0
+        is_active_volume = vol_ratio >= 1.5
+    else:
+        is_high_volume = turnover >= 8
+        is_active_volume = turnover >= 5
+
     is_high_pct = pct >= 3
-    is_above_ma20 = ma20 is not None and close > ma20
+    # MA20 缺失时，默认视为站上均线（因为已经通过涨幅筛选，大概率在涨）
+    is_above_ma20 = True if ma20 is None else (close > ma20)
     deviation = ((close - ma20) / ma20 * 100) if ma20 and ma20 > 0 else 0
 
     if is_high_volume and is_high_pct and is_above_ma20 and deviation > 5:
@@ -328,13 +347,13 @@ def analyze_main_force_stage(vol_ratio: float, pct: float, turnover: float, clos
         stage = "📉 主力出货"
         detail = "放量下跌，主力可能在高位派发"
         confidence = "高"
-    elif not is_high_volume and is_high_pct and deviation < 3:
+    elif is_active_volume and is_high_pct and is_above_ma20:
         stage = "📈 主力建仓"
         detail = "温和放量上涨，主力在悄悄收集筹码"
         confidence = "中"
-    elif vol_ratio < 1.5 and turnover < 3:
+    elif not is_active_volume and turnover < 3:
         stage = "⏸️ 横盘整理"
-        detail = "缩量横盘，方向不明"
+        detail = "缩量横盘，等待方向选择"
         confidence = "低"
     else:
         stage = "🔀 方向不明"
