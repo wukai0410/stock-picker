@@ -1,7 +1,6 @@
-# app.py - 尾盘智能选股工具（完整版：综合评分 + 详情页 + 主力分析 + 资金流向 + 企业微信推送）
+# app.py - 尾盘智能选股工具（AlphaFeed Pro 版）
 # -*- coding: utf-8 -*-
 import streamlit as st
-import akshare as ak
 import pandas as pd
 import numpy as np
 import requests
@@ -9,6 +8,16 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import warnings
 warnings.filterwarnings("ignore")
+
+# ============================================================
+# AlphaFeed 导入和初始化（Pro 版）
+# ============================================================
+from alphafeed import AlphaFeed
+
+# AlphaFeed Pro API Key
+ALPHAFEED_API_KEY = "sk_8d52237598264e3d9f5d95913fc9a404"
+
+af = AlphaFeed(api_key=ALPHAFEED_API_KEY)
 
 # ============================================================
 # 时区工具
@@ -33,6 +42,22 @@ def is_trading_day() -> bool:
     return now.weekday() < 5
 
 # ============================================================
+# 代码格式转换工具
+# ============================================================
+def to_alphafeed_symbol(symbol: str) -> str:
+    """6位数字代码 -> AlphaFeed 格式 (600000 -> 600000.SH)"""
+    symbol = str(symbol).zfill(6)
+    if symbol.startswith('6'):
+        return f"{symbol}.SH"
+    elif symbol.startswith('8') or symbol.startswith('4'):
+        return f"{symbol}.BJ"
+    else:
+        return f"{symbol}.SZ"
+
+def from_alphafeed_symbol(af_symbol: str) -> str:
+    return af_symbol.split('.')[0]
+
+# ============================================================
 # 全局配置
 # ============================================================
 @st.cache_resource
@@ -55,195 +80,117 @@ def get_config():
     }
 
 # ============================================================
-# 列名兼容工具
+# AlphaFeed Pro 数据获取
 # ============================================================
-def _get_column(df: pd.DataFrame, candidates: list) -> str | None:
-    for col in candidates:
-        if col in df.columns:
-            return col
-    for col in df.columns:
-        for c in candidates:
-            if c in col or col in c:
-                return col
-    return None
-
-# ============================================================
-# 数据获取（缓存 + 重试）
-# ============================================================
-
-# 东方财富实时行情 API 字段映射
-_EM_FIELD_MAP = {
-    "f2": "最新价", "f3": "涨跌幅", "f4": "涨跌额",
-    "f5": "成交量", "f6": "成交额", "f7": "振幅",
-    "f8": "换手率", "f9": "市盈率", "f10": "量比",
-    "f12": "代码", "f14": "名称",
-    "f15": "最高", "f16": "最低", "f17": "今开", "f18": "昨收",
-    "f20": "总市值", "f21": "流通市值",
-    "f23": "市净率", "f62": "主力净流入",
-}
-
-def _fetch_em_spot_fallback() -> pd.DataFrame | None:
-    """兜底方案：自己逐页请求东方财富API，每页独立重试，失败页跳过"""
-    import time, random
-    url = "https://82.push2.eastmoney.com/api/qt/clist/get"
-    fields = "f2,f3,f4,f5,f6,f7,f8,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62"
-    base_params = {
-        "pn": "1", "pz": "100", "po": "1", "np": "1",
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        "fltt": "2", "invt": "2", "fid": "f3",
-        "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
-        "fields": fields,
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://quote.eastmoney.com/",
-    }
-
-    # 第1页：获取总数
-    for retry in range(3):
-        try:
-            r = requests.get(url, params=base_params, timeout=20, headers=headers)
-            data = r.json()
-            total = data["data"]["total"]
-            all_items = list(data["data"]["diff"])
-            break
-        except Exception:
-            if retry < 2:
-                time.sleep(2 * (retry + 1))
-            else:
-                return None
-
-    per_page = len(all_items)  # 通常是100
-    total_pages = (total + per_page - 1) // per_page
-    failed_pages = 0
-
-    # 逐页请求，每页独立重试
-    for page in range(2, total_pages + 1):
-        params = {**base_params, "pn": str(page)}
-        page_ok = False
-        for retry in range(3):
-            try:
-                time.sleep(random.uniform(0.3, 0.8))
-                r = requests.get(url, params=params, timeout=15, headers=headers)
-                items = r.json()["data"]["diff"]
-                all_items.extend(items)
-                page_ok = True
-                break
-            except Exception:
-                if retry < 2:
-                    time.sleep(1.5 * (retry + 1))
-        if not page_ok:
-            failed_pages += 1
-            if failed_pages > 5:
-                # 超过5页失败则放弃
-                break
-
-    if not all_items:
-        return None
-
-    df = pd.DataFrame(all_items)
-    # 重命名列
-    rename_map = {k: v for k, v in _EM_FIELD_MAP.items() if k in df.columns}
-    df = df.rename(columns=rename_map)
-
-    # 只保留需要的列
-    keep_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
-    for c in keep_cols:
-        if c not in df.columns:
-            df[c] = None
-    df = df[keep_cols]
-
-    # 数值转换
-    for col in ["涨跌幅", "量比", "成交额", "换手率", "最新价"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df
-
-
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_realtime_quotes():
-    import time
-    last_err = None
-
-    # 方案A：akshare 标准接口
-    for attempt in range(2):
-        try:
-            df = ak.stock_zh_a_spot_em()
-            if df is None or df.empty:
-                time.sleep(1)
-                continue
-            column_mapping = {
-                "代码": ["代码", "code", "股票代码"],
-                "名称": ["名称", "name", "股票名称"],
-                "涨跌幅": ["涨跌幅", "涨跌幅%", "change_pct", "涨幅"],
-                "量比": ["量比", "volume_ratio", "量比(当日)"],
-                "成交额": ["成交额", "amount", "成交金额"],
-                "换手率": ["换手率", "turn_over", "换手率%"],
-                "最新价": ["最新价", "price", "收盘价", "现价"],
-            }
-            mapped_cols = {}
-            for std_name, aliases in column_mapping.items():
-                found = _get_column(df, aliases)
-                if found:
-                    mapped_cols[found] = std_name
-            if mapped_cols:
-                df = df.rename(columns=mapped_cols)
-            required_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
-            missing = [c for c in required_cols if c not in df.columns]
-            if missing:
-                for col in df.columns:
-                    for req in required_cols:
-                        if req in col or col in req:
-                            df = df.rename(columns={col: req})
-                            break
-                missing = [c for c in required_cols if c not in df.columns]
-                if missing:
-                    continue
-            numeric_cols = ["涨跌幅", "量比", "成交额", "换手率", "最新价"]
-            for col in numeric_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            return df
-        except Exception as e:
-            last_err = e
-            if attempt < 1:
-                time.sleep(2)
-
-    # 方案B：兜底——自己逐页请求，容错更强
-    st.warning(f"⚠️ akshare 标准接口失败，尝试兜底方案...")
+    """
+    全市场实时行情（Pro 版：universes="CN_Stock"）
+    返回统一列名：代码、名称、涨跌幅、量比、成交额、换手率、最新价
+    """
     try:
-        df = _fetch_em_spot_fallback()
-        if df is not None and not df.empty:
-            return df
-    except Exception as e:
-        last_err = e
+        # 全 A 股实时快照
+        df = af.quotes.get(universes="CN_Stock", to_dataframe=True)
+        if df is None or df.empty:
+            st.error("❌ AlphaFeed 返回空数据")
+            return None
 
-    return None
+        # 展开 ext 字段（包含 name、change_pct、turnover、volume_ratio）
+        if "ext" in df.columns:
+            ext_df = pd.json_normalize(df["ext"])
+            df = pd.concat([df.drop(columns=["ext"]), ext_df], axis=1)
+
+        # 重命名到统一列名
+        rename_map = {
+            "symbol": "代码",
+            "name": "名称",
+            "change_pct": "涨跌幅",
+            "volume_ratio": "量比",
+            "amount": "成交额",
+            "turnover": "换手率",
+            "last_price": "最新价",
+        }
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+        required_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = None
+
+        df = df[required_cols]
+
+        # 数值转换
+        for col in ["涨跌幅", "量比", "成交额", "换手率", "最新价"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # 涨跌幅从小数转百分比（AlphaFeed 返回 0.06 表示 6%）
+        if "涨跌幅" in df.columns:
+            df["涨跌幅"] = df["涨跌幅"] * 100
+
+        # 删除空值行
+        df = df.dropna(subset=["代码", "最新价"])
+
+        return df
+
+    except Exception as e:
+        st.error(f"❌ AlphaFeed 获取实时行情失败: {e}")
+        return None
+
+
+@st.cache_data(ttl=600)
+def fetch_ma20(symbol: str) -> float | None:
+    """获取个股20日均线"""
+    try:
+        af_symbol = to_alphafeed_symbol(symbol)
+        df = af.klines.get(
+            af_symbol,
+            period="1d",
+            count=300,
+            adjust="forward",
+            to_dataframe=True,
+        )
+        if df is None or df.empty:
+            return None
+        df = df.sort_values("trade_date").reset_index(drop=True)
+        closes = df["close"].dropna()
+        if len(closes) < 20:
+            return None
+        return closes.tail(20).mean()
+    except Exception as e:
+        return None
+
 
 @st.cache_data(ttl=60)
 def fetch_intraday_minute(symbol: str):
+    """获取当日1分钟分时数据"""
     try:
-        df = ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")
+        af_symbol = to_alphafeed_symbol(symbol)
+        df = af.klines.intraday(
+            af_symbol,
+            period="1m",
+            to_dataframe=True,
+        )
         if df is None or df.empty:
             return None
-        vol_col = _get_column(df, ["成交量", "volume", "vol", "VOL"])
-        close_col = _get_column(df, ["收盘", "close", "price", "最新价"])
-        if vol_col is None or close_col is None:
-            return None
-        df = df.rename(columns={vol_col: "volume", close_col: "close"})
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        return df.dropna(subset=["volume", "close"])
+        df = df.sort_values("trade_time").reset_index(drop=True)
+        return df
     except Exception:
         return None
 
+
 @st.cache_data(ttl=300)
 def fetch_a50_change() -> float:
+    """获取富时A50涨跌幅（AlphaFeed 暂不支持，用 akshare 兜底）"""
     try:
+        import akshare as ak
         df = ak.futures_zh_minute_sina(symbol="A50")
         if df is None or df.empty or len(df) < 2:
             return 0.0
-        price_col = _get_column(df, ["收盘价", "close", "price"])
+        price_col = None
+        for c in df.columns:
+            if "收盘价" in c or "close" in c.lower():
+                price_col = c
+                break
         if price_col is None:
             return 0.0
         prices = pd.to_numeric(df[price_col], errors="coerce").dropna()
@@ -256,60 +203,35 @@ def fetch_a50_change() -> float:
     except Exception:
         return 0.0
 
-@st.cache_data(ttl=600)
-def fetch_ma20(symbol: str) -> float | None:
-    try:
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq", start_date="20240101")
-        if df is None or df.empty:
-            return None
-        close_col = _get_column(df, ["收盘", "close"])
-        if close_col is None:
-            return None
-        closes = pd.to_numeric(df[close_col], errors="coerce").dropna()
-        if len(closes) < 20:
-            return None
-        return closes.tail(20).mean()
-    except Exception:
-        return None
 
 # ============================================================
-# 资金流向数据获取
+# 资金流向（akshare 龙虎榜兜底）
 # ============================================================
 @st.cache_data(ttl=3600)
 def fetch_fund_flow(symbol: str) -> dict:
-    """
-    获取近10日机构和大户资金流入流出情况
-    返回：机构净流入、大户净流入、近10日每日数据
-    """
     result = {
         "institution": {"流入": 0, "流出": 0, "净额": 0},
         "big_trader": {"流入": 0, "流出": 0, "净额": 0},
         "available": False,
-        "error": None,
         "source": None
     }
-    
-    # 方法1：龙虎榜数据（机构席位）
     try:
+        import akshare as ak
         df = ak.stock_lhb_em(symbol=symbol)
         if df is not None and not df.empty:
             df = df.head(10)
-            # 检查是否有机构席位
-            has_inst = False
             if "买方席位名称" in df.columns:
                 inst_mask = df["买方席位名称"].str.contains("机构", na=False) | df["卖方席位名称"].str.contains("机构", na=False)
                 inst_data = df[inst_mask]
                 if not inst_data.empty:
-                    has_inst = True
                     inst_in = inst_data[inst_data["买卖方向"] == "买入"]["成交额"].sum() / 1e8
                     inst_out = inst_data[inst_data["买卖方向"] == "卖出"]["成交额"].sum() / 1e8
                     result["institution"]["流入"] = round(inst_in, 2)
                     result["institution"]["流出"] = round(inst_out, 2)
                     result["institution"]["净额"] = round(inst_in - inst_out, 2)
-                    result["source"] = "龙虎榜-机构席位"
-            
-            # 大户统计（非机构的大额交易）
-            if "买方席位名称" in df.columns:
+                    result["available"] = True
+                    result["source"] = "龙虎榜"
+
                 non_inst_mask = ~df["买方席位名称"].str.contains("机构", na=False) & ~df["卖方席位名称"].str.contains("机构", na=False)
                 bt_data = df[non_inst_mask]
                 if not bt_data.empty:
@@ -318,83 +240,27 @@ def fetch_fund_flow(symbol: str) -> dict:
                     result["big_trader"]["流入"] = round(bt_in, 2)
                     result["big_trader"]["流出"] = round(bt_out, 2)
                     result["big_trader"]["净额"] = round(bt_in - bt_out, 2)
-                    if result["source"] is None:
-                        result["source"] = "龙虎榜-大户席位"
-            
-            if has_inst:
-                result["available"] = True
-                return result
-    except Exception as e:
-        result["error"] = str(e)
-    
-    # 方法2：大单资金流向（逐笔数据）
-    try:
-        df = ak.stock_large_order_em(symbol=symbol)
-        if df is not None and not df.empty:
-            df = df.head(10)
-            # 超大单（>100万）视为机构
-            super_df = df[df["订单类型"].str.contains("超大单", na=False)]
-            if not super_df.empty:
-                super_net = super_df["净流入"].sum() / 1e8
-                result["institution"]["净额"] = round(super_net, 2)
-                result["institution"]["流入"] = round(super_df[super_df["净流入"] > 0]["净流入"].sum() / 1e8, 2) if not super_df[super_df["净流入"] > 0].empty else 0
-                result["institution"]["流出"] = round(abs(super_df[super_df["净流入"] < 0]["净流入"].sum() / 1e8), 2) if not super_df[super_df["净流入"] < 0].empty else 0
-            
-            # 大单（50-100万）视为大户
-            large_df = df[df["订单类型"].str.contains("大单", na=False)]
-            if not large_df.empty:
-                large_net = large_df["净流入"].sum() / 1e8
-                result["big_trader"]["净额"] = round(large_net, 2)
-                result["big_trader"]["流入"] = round(large_df[large_df["净流入"] > 0]["净流入"].sum() / 1e8, 2) if not large_df[large_df["净流入"] > 0].empty else 0
-                result["big_trader"]["流出"] = round(abs(large_df[large_df["净流入"] < 0]["净流入"].sum() / 1e8), 2) if not large_df[large_df["净流入"] < 0].empty else 0
-            
-            if not super_df.empty or not large_df.empty:
-                result["available"] = True
-                result["source"] = "逐笔大单数据"
-                return result
-    except Exception as e:
-        result["error"] = str(e)
-    
+                    result["available"] = True
+                    result["source"] = "龙虎榜"
+    except Exception:
+        pass
     return result
 
-
 def get_fund_flow_summary(symbol: str) -> dict:
-    """获取资金流向摘要，用于详情页展示"""
     data = fetch_fund_flow(symbol)
-    
     if not data["available"]:
-        return {
-            "has_data": False,
-            "message": "暂无近10日资金流向数据（该股可能未上榜龙虎榜或数据源限制）"
-        }
-    
+        return {"has_data": False, "message": "暂无近10日资金流向数据"}
     inst = data["institution"]
     big = data["big_trader"]
-    
     inst_status = "净流入" if inst["净额"] > 0 else ("净流出" if inst["净额"] < 0 else "持平")
     big_status = "净流入" if big["净额"] > 0 else ("净流出" if big["净额"] < 0 else "持平")
-    inst_color = "🟢" if inst["净额"] > 0 else ("🔴" if inst["净额"] < 0 else "⚪")
-    big_color = "🟢" if big["净额"] > 0 else ("🔴" if big["净额"] < 0 else "⚪")
-    
     return {
         "has_data": True,
         "source": data.get("source", "龙虎榜"),
-        "institution": {
-            "流入": inst["流入"],
-            "流出": inst["流出"],
-            "净额": inst["净额"],
-            "status": inst_status,
-            "color": inst_color
-        },
-        "big_trader": {
-            "流入": big["流入"],
-            "流出": big["流出"],
-            "净额": big["净额"],
-            "status": big_status,
-            "color": big_color
-        },
-        "summary": f"机构{inst_status} {inst_color}，大户{big_status} {big_color}"
+        "institution": {"流入": inst["流入"], "流出": inst["流出"], "净额": inst["净额"], "status": inst_status},
+        "big_trader": {"流入": big["流入"], "流出": big["流出"], "净额": big["净额"], "status": big_status}
     }
+
 
 # ============================================================
 # 综合评分系统（满分100分）
@@ -423,19 +289,16 @@ def calc_composite_score(vol_ratio: float, turnover: float, pct: float, close: f
             score += 10
     return min(score, 100)
 
-# ============================================================
-# 主力阶段分析
-# ============================================================
+
 def analyze_main_force_stage(vol_ratio: float, pct: float, turnover: float, close: float, ma20: float | None) -> dict:
     is_high_volume = vol_ratio >= 2.0
-    is_high_turnover = turnover >= 5
     is_high_pct = pct >= 3
     is_above_ma20 = ma20 is not None and close > ma20
     deviation = ((close - ma20) / ma20 * 100) if ma20 and ma20 > 0 else 0
 
     if is_high_volume and is_high_pct and is_above_ma20 and deviation > 5:
         stage = "🚀 主升浪拉升"
-        detail = "放量上涨，股价远高于均线，主力拉升阶段"
+        detail = "放量上涨，主力拉升阶段"
         confidence = "高"
     elif is_high_volume and not is_high_pct and is_above_ma20:
         stage = "📦 震荡洗盘"
@@ -443,7 +306,7 @@ def analyze_main_force_stage(vol_ratio: float, pct: float, turnover: float, clos
         confidence = "中"
     elif is_high_volume and pct < 0:
         stage = "📉 主力出货"
-        detail = "放量下跌，主力可能在高位派发筹码"
+        detail = "放量下跌，主力可能在高位派发"
         confidence = "高"
     elif not is_high_volume and is_high_pct and deviation < 3:
         stage = "📈 主力建仓"
@@ -451,27 +314,18 @@ def analyze_main_force_stage(vol_ratio: float, pct: float, turnover: float, clos
         confidence = "中"
     elif vol_ratio < 1.5 and turnover < 3:
         stage = "⏸️ 横盘整理"
-        detail = "缩量横盘，方向不明，等待突破"
+        detail = "缩量横盘，方向不明"
         confidence = "低"
     else:
         stage = "🔀 方向不明"
         detail = "量价关系不明确，建议观望"
         confidence = "低"
 
-    return {
-        "stage": stage,
-        "detail": detail,
-        "confidence": confidence,
-        "deviation": round(deviation, 2)
-    }
+    return {"stage": stage, "detail": detail, "confidence": confidence, "deviation": round(deviation, 2)}
 
-# ============================================================
-# 走势预判
-# ============================================================
+
 def predict_trend(score: int, stage_info: dict, pct: float, fund_summary: dict = None) -> dict:
     confidence = stage_info.get("confidence", "低")
-    
-    # 如果有资金流向数据，结合判断
     fund_boost = 0
     if fund_summary and fund_summary.get("has_data"):
         inst_net = fund_summary["institution"]["净额"]
@@ -515,17 +369,9 @@ def predict_trend(score: int, stage_info: dict, pct: float, fund_summary: dict =
     elif fund_boost < 0:
         reason += "；机构/大户资金净流出，需谨慎"
 
-    return {
-        "trend": trend,
-        "suggestion": suggestion,
-        "reason": reason,
-        "confidence": confidence,
-        "fund_boost": fund_boost
-    }
+    return {"trend": trend, "suggestion": suggestion, "reason": reason, "confidence": confidence, "fund_boost": fund_boost}
 
-# ============================================================
-# 计算建议购入价和止损价
-# ============================================================
+
 def calc_price_levels(close: float, ma20: float | None, pct: float) -> dict:
     if ma20 is not None and ma20 > 0:
         support = round(ma20, 2)
@@ -537,18 +383,9 @@ def calc_price_levels(close: float, ma20: float | None, pct: float) -> dict:
         buy_price = round(close * 0.98, 2)
         stop_loss = round(close * 0.92, 2)
         target = round(close * 1.05, 2)
+    return {"current": round(close, 2), "buy_price": buy_price, "stop_loss": stop_loss, "target": target, "support": support}
 
-    return {
-        "current": round(close, 2),
-        "buy_price": buy_price,
-        "stop_loss": stop_loss,
-        "target": target,
-        "support": support
-    }
 
-# ============================================================
-# 抢筹分析
-# ============================================================
 def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
     if df_1min is None or len(df_1min) < 10:
         return {"label": "数据不足", "score": 0, "detail": ""}
@@ -575,13 +412,10 @@ def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
             label = "偏弱"
         else:
             label = "无抢筹"
-        return {
-            "label": label,
-            "score": round(score, 1),
-            "detail": f"尾盘量比{last5_ratio:.1%}，斜率{slope_factor:.3f}",
-        }
+        return {"label": label, "score": round(score, 1), "detail": f"尾盘量比{last5_ratio:.1%}，斜率{slope_factor:.3f}"}
     except Exception:
         return {"label": "异常", "score": 0, "detail": ""}
+
 
 # ============================================================
 # 企业微信推送
@@ -639,9 +473,7 @@ def send_wecom_message(df: pd.DataFrame, summary: dict) -> bool:
         vol = row.get("量比", 0)
         score = row.get("综合评分", 0)
         stage = row.get("主力阶段", "-")
-
         emoji = "🚀" if chg > 5 else ("🔥" if chg > 3 else "📌")
-
         msg_lines.append(f"{i}. {emoji} **{name}**（{code}）")
         msg_lines.append(f"   涨幅：{chg:+.2f}% ｜ 量比：{vol:.2f} ｜ 评分：{score}分")
         msg_lines.append(f"   {stage}")
@@ -664,6 +496,7 @@ def send_wecom_message(df: pd.DataFrame, summary: dict) -> bool:
         return data.get("errcode") == 0
     except Exception:
         return False
+
 
 # ============================================================
 # 主选股逻辑
@@ -724,8 +557,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             composite_score = calc_composite_score(vol_ratio, turnover, chg, close, ma20)
             stage_info = analyze_main_force_stage(vol_ratio, chg, turnover, close, ma20)
             price_levels = calc_price_levels(close, ma20, chg)
-            
-            # 获取资金流向（用于走势预判）
+
             fund_summary = get_fund_flow_summary(symbol)
             trend_info = predict_trend(composite_score, stage_info, chg, fund_summary)
 
@@ -760,7 +592,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
                 "抢筹评分": rush["score"],
                 "_sort_key": composite_score,
             })
-        except Exception:
+        except Exception as e:
             errors += 1
             continue
 
@@ -799,6 +631,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
 
     return df_result
 
+
 # ============================================================
 # 结果存储
 # ============================================================
@@ -819,6 +652,7 @@ def save_daily_results(df: pd.DataFrame):
     st.session_state["last_results"] = df
     st.session_state["last_results_ts"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
 
+
 def load_daily_results(date_str: str) -> pd.DataFrame | None:
     history = st.session_state.get("history_results", {})
     record = history.get(date_str)
@@ -826,10 +660,12 @@ def load_daily_results(date_str: str) -> pd.DataFrame | None:
         return None
     return pd.DataFrame(record["data"])
 
+
 def load_last_results() -> tuple[pd.DataFrame | None, str | None]:
     df = st.session_state.get("last_results")
     ts = st.session_state.get("last_results_ts")
     return df, ts
+
 
 # ============================================================
 # 渲染函数
@@ -860,6 +696,7 @@ def render_summary_panel():
     if info_parts:
         st.caption("🏷️ " + "　|　".join(info_parts))
     st.divider()
+
 
 def render_yesterday_review():
     today = today_str()
@@ -902,8 +739,9 @@ def render_yesterday_review():
         else:
             st.info("📊 今日与昨日无重叠股票")
 
+
 # ============================================================
-# 股票详情页（含资金流向）
+# 股票详情页
 # ============================================================
 def render_stock_detail(symbol: str):
     df_result, _ = load_last_results()
@@ -919,15 +757,13 @@ def render_stock_detail(symbol: str):
     row = stock_row.iloc[0]
 
     st.subheader(f"📊 {row['名称']}（{row['代码']}）详细分析")
-    
-    # 返回按钮
+
     if st.button("← 返回列表"):
         st.session_state["selected_stock"] = None
         st.rerun()
-    
+
     st.divider()
 
-    # 基本信息
     col1, col2, col3 = st.columns(3)
     col1.metric("最新价", f"{row['最新价']} 元", delta=f"{row['涨跌幅%']:+.2f}%")
     col2.metric("综合评分", f"{row['综合评分']} 分", delta="满分100分")
@@ -935,7 +771,6 @@ def render_stock_detail(symbol: str):
 
     st.divider()
 
-    # 价格参考
     st.subheader("💰 价格参考")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("建议购入价", f"{row.get('建议购入价', '-')} 元")
@@ -945,7 +780,6 @@ def render_stock_detail(symbol: str):
 
     st.divider()
 
-    # 走势预判
     st.subheader("🔮 走势预判")
     trend = row.get("走势预判", "-")
     suggestion = row.get("操作建议", "-")
@@ -961,7 +795,6 @@ def render_stock_detail(symbol: str):
 
     st.divider()
 
-    # 主力阶段分析
     st.subheader("📈 主力阶段分析")
     st.info(f"**{row.get('主力阶段', '-')}**")
     st.caption(f"📝 {row.get('阶段详情', '-')}")
@@ -969,7 +802,6 @@ def render_stock_detail(symbol: str):
 
     st.divider()
 
-    # 技术指标
     st.subheader("📊 技术指标")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("量比", row.get("量比", "-"))
@@ -984,9 +816,7 @@ def render_stock_detail(symbol: str):
 
     st.divider()
 
-    # ============================================================
-    # 新增：近10日机构、大户资金流向
-    # ============================================================
+    # 资金流向
     st.subheader("💰 近10日资金流向")
 
     with st.spinner("正在获取资金流向数据..."):
@@ -1004,7 +834,7 @@ def render_stock_detail(symbol: str):
                     <tr><td style="padding:4px 0;">流入</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#52c41a;">{inst['流入']:.2f} 亿</td></tr>
                     <tr><td style="padding:4px 0;">流出</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#ff4d4f;">{inst['流出']:.2f} 亿</td></tr>
                     <tr><td style="padding:4px 0;border-top:1px solid #e0e0e0;">净额</td>
-                        <td style="padding:4px 0;text-align:right;font-weight:bold;border-top:1px solid #e0e0e0;color:{'#52c41a' if inst['净额'] >= 0 else '#ff4d4f'};">{inst['color']} {inst['净额']:+.2f} 亿</td></tr>
+                        <td style="padding:4px 0;text-align:right;font-weight:bold;border-top:1px solid #e0e0e0;color:{'#52c41a' if inst['净额'] >= 0 else '#ff4d4f'};">{inst['净额']:+.2f} 亿</td></tr>
                     <tr><td style="padding:4px 0;">状态</td>
                         <td style="padding:4px 0;text-align:right;font-weight:bold;color:{'#52c41a' if inst['净额'] >= 0 else '#ff4d4f'};">{inst['status']}</td></tr>
                 </table>
@@ -1020,7 +850,7 @@ def render_stock_detail(symbol: str):
                     <tr><td style="padding:4px 0;">流入</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#52c41a;">{big['流入']:.2f} 亿</td></tr>
                     <tr><td style="padding:4px 0;">流出</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#ff4d4f;">{big['流出']:.2f} 亿</td></tr>
                     <tr><td style="padding:4px 0;border-top:1px solid #e0e0e0;">净额</td>
-                        <td style="padding:4px 0;text-align:right;font-weight:bold;border-top:1px solid #e0e0e0;color:{'#52c41a' if big['净额'] >= 0 else '#ff4d4f'};">{big['color']} {big['净额']:+.2f} 亿</td></tr>
+                        <td style="padding:4px 0;text-align:right;font-weight:bold;border-top:1px solid #e0e0e0;color:{'#52c41a' if big['净额'] >= 0 else '#ff4d4f'};">{big['净额']:+.2f} 亿</td></tr>
                     <tr><td style="padding:4px 0;">状态</td>
                         <td style="padding:4px 0;text-align:right;font-weight:bold;color:{'#52c41a' if big['净额'] >= 0 else '#ff4d4f'};">{big['status']}</td></tr>
                 </table>
@@ -1028,11 +858,10 @@ def render_stock_detail(symbol: str):
             """, unsafe_allow_html=True)
 
         st.caption(f"📌 数据来源：{fund_data.get('source', '龙虎榜')} | 近10日统计")
-        
-        # 综合资金判断
+
         inst_net = fund_data["institution"]["净额"]
         big_net = fund_data["big_trader"]["净额"]
-        
+
         if inst_net > 0 and big_net > 0:
             st.success("✅ 机构和大户均呈净流入，主力看好该股")
         elif inst_net > 0 and big_net < 0:
@@ -1048,11 +877,11 @@ def render_stock_detail(symbol: str):
         st.info(f"ℹ️ {fund_data.get('message', '暂无数据')}")
 
     st.divider()
-    
-    # 返回按钮（底部）
+
     if st.button("← 返回列表", use_container_width=True):
         st.session_state["selected_stock"] = None
         st.rerun()
+
 
 # ============================================================
 # 主页面
@@ -1066,7 +895,7 @@ def main_page():
     )
 
     st.title("📈 尾盘智能选股工具")
-    st.caption("基于 akshare 实时数据 + 综合评分系统 + 主力分析")
+    st.caption("基于 AlphaFeed Pro 数据源 + 综合评分系统 + 主力分析")
 
     with st.sidebar:
         st.header("⚙️ 参数设置")
@@ -1121,7 +950,7 @@ def main_page():
 
         st.divider()
         st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
-        st.caption("数据来源：akshare")
+        st.caption("数据来源：AlphaFeed Pro + 龙虎榜（akshare）")
 
     if st.session_state.get("selected_stock") is not None:
         render_stock_detail(st.session_state["selected_stock"])
@@ -1174,9 +1003,7 @@ def main_page():
                 use_container_width=True,
                 hide_index=True,
             )
-            st.caption("💡 评分 ≥ 70 分的股票已用绿色背景高亮（在网页显示中）")
-        else:
-            st.info("ℹ️ 暂无评分 ≥ 70 的股票")
+            st.caption("💡 评分 ≥ 70 分的股票已用绿色背景高亮")
 
         st.subheader("🔍 点击查看详情")
         selected_code = st.selectbox(
@@ -1195,6 +1022,7 @@ def main_page():
             file_name=f"尾盘选股_{now.strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
         )
+
     else:
         st.info("💡 暂无选股结果，请点击侧边栏「运行选股」按钮")
 
@@ -1203,6 +1031,7 @@ def main_page():
     st.divider()
     st.caption(f"🔄 数据更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）")
     st.caption("⚠️ 以上内容仅供参考，不构成投资建议。股市有风险，投资需谨慎。")
+
 
 # ============================================================
 # 程序入口
