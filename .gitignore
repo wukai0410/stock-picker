@@ -1,0 +1,13 @@
+# WorkBuddy internal data
+.workbuddy/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
