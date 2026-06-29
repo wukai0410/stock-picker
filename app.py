@@ -23,16 +23,14 @@ def today_str() -> str:
 def is_tail_time() -> bool:
     """判断当前是否处于尾盘时段（14:30:00 <= time <= 15:00:00）"""
     now = beijing_now()
-    # 构造今天14:30和15:00的时间戳
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     tail_start = today.replace(hour=14, minute=30, second=0)
     tail_end = today.replace(hour=15, minute=0, second=0)
     return tail_start <= now <= tail_end
 
 def is_trading_day() -> bool:
-    """判断今天是否为交易日（简单判断：周一至周五且非法定节假日）"""
+    """判断今天是否为交易日（简单判断：周一至周五）"""
     now = beijing_now()
-    # 简单判断：周一(0)到周五(4)
     return now.weekday() < 5
 
 # ============================================================
@@ -74,7 +72,6 @@ def fetch_realtime_quotes():
         df = ak.stock_zh_a_spot_em()
         if df is None or df.empty:
             return None
-        # 列名映射（兼容不同版本的akshare）
         column_mapping = {
             "代码": ["代码", "code", "股票代码"],
             "名称": ["名称", "name", "股票名称"],
@@ -95,7 +92,6 @@ def fetch_realtime_quotes():
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
             st.warning(f"⚠️ 数据源列名不匹配，缺失: {missing}。尝试自动适配...")
-            # 尝试从原始列名中推断
             for col in df.columns:
                 for req in required_cols:
                     if req in col or col in req:
@@ -105,7 +101,6 @@ def fetch_realtime_quotes():
             if missing:
                 st.error(f"❌ 无法识别必要列: {missing}，请检查 akshare 版本")
                 return None
-        # 数据类型转换
         numeric_cols = ["涨跌幅", "量比", "成交额", "换手率", "最新价"]
         for col in numeric_cols:
             if col in df.columns:
@@ -121,7 +116,7 @@ def fetch_daily_kline(symbol: str, days: int = 30):
     try:
         end_date = beijing_now().strftime("%Y%m%d")
         start_date = (beijing_now() - timedelta(days=days*2)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq", 
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq",
                                 start_date=start_date, end_date=end_date)
         if df is None or df.empty:
             return None
@@ -180,7 +175,6 @@ def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
     if df_1min is None or len(df_1min) < 10:
         return {"label": "数据不足", "score": 0, "detail": ""}
     try:
-        # 取最后30分钟的数据
         last_30 = df_1min.tail(30)
         if len(last_30) < 5:
             return {"label": "数据不足", "score": 0, "detail": ""}
@@ -189,14 +183,11 @@ def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
         total_vol = vols.sum()
         last5_vol = vols[-5:].sum() if len(vols) >= 5 else total_vol
         last5_ratio = last5_vol / total_vol if total_vol > 0 else 0
-        # 计算价格斜率
         x = np.arange(len(closes))
         slope = np.polyfit(x, closes, 1)[0]
         slope_factor = max(slope / closes[0] * 100, 0.0) if closes[0] != 0 else 0.0
-        # 综合评分
         score = last5_ratio * 50 + min(slope_factor * 10, 50)
         score = min(score, 100)
-        # 分级
         if score > 70 and last5_ratio > 0.25 and slope_factor > 0.08:
             strength = "强" if last5_ratio > 0.35 else "中"
             label = f"真抢筹({strength})"
@@ -284,7 +275,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
                 "抢筹评分": rush["score"],
                 "_sort_key": vol_ratio,
             })
-        except Exception as e:
+        except Exception:
             errors += 1
             continue
     progress.progress(1.0, text="✅ 选股完成！")
@@ -375,14 +366,14 @@ def render_yesterday_review():
     with col1:
         st.caption(f"📌 今日 ({today})")
         if df_today is not None and not df_today.empty:
-            st.dataframe(df_today[["代码", "名称", "涨跌幅%", "量比", "抢筹"]], 
+            st.dataframe(df_today[["代码", "名称", "涨跌幅%", "量比", "抢筹"]],
                         use_container_width=True, hide_index=True)
         else:
             st.text("今日暂无数据")
     with col2:
         st.caption(f"📌 昨日 ({yesterday})")
         if df_yesterday is not None and not df_yesterday.empty:
-            st.dataframe(df_yesterday[["代码", "名称", "涨跌幅%", "量比", "抢筹"]], 
+            st.dataframe(df_yesterday[["代码", "名称", "涨跌幅%", "量比", "抢筹"]],
                         use_container_width=True, hide_index=True)
         else:
             st.text("昨日暂无数据")
@@ -398,7 +389,7 @@ def render_yesterday_review():
                     lambda x: f"⭐ {x}" if not str(x).startswith("⭐") else x
                 )
             st.success(f"⭐ 连续上榜：{len(overlap)} 只股票")
-            st.dataframe(overlap_df[["代码", "名称", "涨跌幅%", "量比", "抢筹"]], 
+            st.dataframe(overlap_df[["代码", "名称", "涨跌幅%", "量比", "抢筹"]],
                         use_container_width=True, hide_index=True)
         else:
             st.info("📊 今日与昨日无重叠股票，市场风格可能切换")
@@ -443,7 +434,7 @@ with st.sidebar:
         st.warning("⚠️ 今日非交易日，展示历史数据或手动运行")
     # 抢筹分析开关（非尾盘时段禁用）
     enable_rush = st.checkbox(
-        "🔍 启用尾盘抢筹分析", 
+        "🔍 启用尾盘抢筹分析",
         value=tail_time and trading_day,
         disabled=not (tail_time and trading_day),
         help="仅在尾盘时段（14:30-15:00）可用" if not (tail_time and trading_day) else "分析尾盘抢筹强度"
