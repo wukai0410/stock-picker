@@ -1,4 +1,4 @@
-# app.py - 尾盘智能选股工具（完整版：综合评分 + 详情页 + 主力分析 + 企业微信推送）
+# app.py - 尾盘智能选股工具（完整版：综合评分 + 详情页 + 主力分析 + 资金流向 + 企业微信推送）
 # -*- coding: utf-8 -*-
 import streamlit as st
 import akshare as ak
@@ -171,6 +171,130 @@ def fetch_ma20(symbol: str) -> float | None:
         return None
 
 # ============================================================
+# 资金流向数据获取
+# ============================================================
+@st.cache_data(ttl=3600)
+def fetch_fund_flow(symbol: str) -> dict:
+    """
+    获取近10日机构和大户资金流入流出情况
+    返回：机构净流入、大户净流入、近10日每日数据
+    """
+    result = {
+        "institution": {"流入": 0, "流出": 0, "净额": 0},
+        "big_trader": {"流入": 0, "流出": 0, "净额": 0},
+        "available": False,
+        "error": None,
+        "source": None
+    }
+    
+    # 方法1：龙虎榜数据（机构席位）
+    try:
+        df = ak.stock_lhb_em(symbol=symbol)
+        if df is not None and not df.empty:
+            df = df.head(10)
+            # 检查是否有机构席位
+            has_inst = False
+            if "买方席位名称" in df.columns:
+                inst_mask = df["买方席位名称"].str.contains("机构", na=False) | df["卖方席位名称"].str.contains("机构", na=False)
+                inst_data = df[inst_mask]
+                if not inst_data.empty:
+                    has_inst = True
+                    inst_in = inst_data[inst_data["买卖方向"] == "买入"]["成交额"].sum() / 1e8
+                    inst_out = inst_data[inst_data["买卖方向"] == "卖出"]["成交额"].sum() / 1e8
+                    result["institution"]["流入"] = round(inst_in, 2)
+                    result["institution"]["流出"] = round(inst_out, 2)
+                    result["institution"]["净额"] = round(inst_in - inst_out, 2)
+                    result["source"] = "龙虎榜-机构席位"
+            
+            # 大户统计（非机构的大额交易）
+            if "买方席位名称" in df.columns:
+                non_inst_mask = ~df["买方席位名称"].str.contains("机构", na=False) & ~df["卖方席位名称"].str.contains("机构", na=False)
+                bt_data = df[non_inst_mask]
+                if not bt_data.empty:
+                    bt_in = bt_data[bt_data["买卖方向"] == "买入"]["成交额"].sum() / 1e8
+                    bt_out = bt_data[bt_data["买卖方向"] == "卖出"]["成交额"].sum() / 1e8
+                    result["big_trader"]["流入"] = round(bt_in, 2)
+                    result["big_trader"]["流出"] = round(bt_out, 2)
+                    result["big_trader"]["净额"] = round(bt_in - bt_out, 2)
+                    if result["source"] is None:
+                        result["source"] = "龙虎榜-大户席位"
+            
+            if has_inst:
+                result["available"] = True
+                return result
+    except Exception as e:
+        result["error"] = str(e)
+    
+    # 方法2：大单资金流向（逐笔数据）
+    try:
+        df = ak.stock_large_order_em(symbol=symbol)
+        if df is not None and not df.empty:
+            df = df.head(10)
+            # 超大单（>100万）视为机构
+            super_df = df[df["订单类型"].str.contains("超大单", na=False)]
+            if not super_df.empty:
+                super_net = super_df["净流入"].sum() / 1e8
+                result["institution"]["净额"] = round(super_net, 2)
+                result["institution"]["流入"] = round(super_df[super_df["净流入"] > 0]["净流入"].sum() / 1e8, 2) if not super_df[super_df["净流入"] > 0].empty else 0
+                result["institution"]["流出"] = round(abs(super_df[super_df["净流入"] < 0]["净流入"].sum() / 1e8), 2) if not super_df[super_df["净流入"] < 0].empty else 0
+            
+            # 大单（50-100万）视为大户
+            large_df = df[df["订单类型"].str.contains("大单", na=False)]
+            if not large_df.empty:
+                large_net = large_df["净流入"].sum() / 1e8
+                result["big_trader"]["净额"] = round(large_net, 2)
+                result["big_trader"]["流入"] = round(large_df[large_df["净流入"] > 0]["净流入"].sum() / 1e8, 2) if not large_df[large_df["净流入"] > 0].empty else 0
+                result["big_trader"]["流出"] = round(abs(large_df[large_df["净流入"] < 0]["净流入"].sum() / 1e8), 2) if not large_df[large_df["净流入"] < 0].empty else 0
+            
+            if not super_df.empty or not large_df.empty:
+                result["available"] = True
+                result["source"] = "逐笔大单数据"
+                return result
+    except Exception as e:
+        result["error"] = str(e)
+    
+    return result
+
+
+def get_fund_flow_summary(symbol: str) -> dict:
+    """获取资金流向摘要，用于详情页展示"""
+    data = fetch_fund_flow(symbol)
+    
+    if not data["available"]:
+        return {
+            "has_data": False,
+            "message": "暂无近10日资金流向数据（该股可能未上榜龙虎榜或数据源限制）"
+        }
+    
+    inst = data["institution"]
+    big = data["big_trader"]
+    
+    inst_status = "净流入" if inst["净额"] > 0 else ("净流出" if inst["净额"] < 0 else "持平")
+    big_status = "净流入" if big["净额"] > 0 else ("净流出" if big["净额"] < 0 else "持平")
+    inst_color = "🟢" if inst["净额"] > 0 else ("🔴" if inst["净额"] < 0 else "⚪")
+    big_color = "🟢" if big["净额"] > 0 else ("🔴" if big["净额"] < 0 else "⚪")
+    
+    return {
+        "has_data": True,
+        "source": data.get("source", "龙虎榜"),
+        "institution": {
+            "流入": inst["流入"],
+            "流出": inst["流出"],
+            "净额": inst["净额"],
+            "status": inst_status,
+            "color": inst_color
+        },
+        "big_trader": {
+            "流入": big["流入"],
+            "流出": big["流出"],
+            "净额": big["净额"],
+            "status": big_status,
+            "color": big_color
+        },
+        "summary": f"机构{inst_status} {inst_color}，大户{big_status} {big_color}"
+    }
+
+# ============================================================
 # 综合评分系统（满分100分）
 # ============================================================
 def calc_composite_score(vol_ratio: float, turnover: float, pct: float, close: float, ma20: float | None) -> int:
@@ -242,26 +366,40 @@ def analyze_main_force_stage(vol_ratio: float, pct: float, turnover: float, clos
 # ============================================================
 # 走势预判
 # ============================================================
-def predict_trend(score: int, stage_info: dict, pct: float) -> dict:
+def predict_trend(score: int, stage_info: dict, pct: float, fund_summary: dict = None) -> dict:
     confidence = stage_info.get("confidence", "低")
+    
+    # 如果有资金流向数据，结合判断
+    fund_boost = 0
+    if fund_summary and fund_summary.get("has_data"):
+        inst_net = fund_summary["institution"]["净额"]
+        big_net = fund_summary["big_trader"]["净额"]
+        if inst_net > 0 and big_net > 0:
+            fund_boost = 10
+        elif inst_net > 0 or big_net > 0:
+            fund_boost = 5
+        elif inst_net < 0 and big_net < 0:
+            fund_boost = -10
 
-    if score >= 80 and "拉升" in stage_info["stage"]:
+    adjusted_score = min(100, score + fund_boost)
+
+    if adjusted_score >= 80 and "拉升" in stage_info["stage"]:
         trend = "📈 短期看涨"
         suggestion = "✅ 强烈推荐关注"
         reason = "综合评分高，主力处于拉升阶段"
-    elif score >= 70 and "建仓" in stage_info["stage"]:
+    elif adjusted_score >= 70 and "建仓" in stage_info["stage"]:
         trend = "📈 中期看涨"
         suggestion = "✅ 建议关注"
         reason = "主力在建仓，评分良好"
-    elif score >= 60 and "震荡" in stage_info["stage"]:
+    elif adjusted_score >= 60 and "震荡" in stage_info["stage"]:
         trend = "➡️ 震荡偏多"
         suggestion = "⏳ 等待突破"
         reason = "震荡洗盘阶段，等待放量突破"
-    elif score >= 70 and "出货" in stage_info["stage"]:
+    elif adjusted_score >= 70 and "出货" in stage_info["stage"]:
         trend = "📉 短期看跌"
         suggestion = "⚠️ 建议回避"
         reason = "主力出货迹象，风险较高"
-    elif score < 60:
+    elif adjusted_score < 60:
         trend = "📉 短期看跌"
         suggestion = "⚠️ 建议观望"
         reason = "综合评分较低，暂不介入"
@@ -270,11 +408,17 @@ def predict_trend(score: int, stage_info: dict, pct: float) -> dict:
         suggestion = "⏳ 建议观望"
         reason = "技术指标不明确"
 
+    if fund_boost > 0:
+        reason += "；机构/大户资金净流入，加分"
+    elif fund_boost < 0:
+        reason += "；机构/大户资金净流出，需谨慎"
+
     return {
         "trend": trend,
         "suggestion": suggestion,
         "reason": reason,
-        "confidence": confidence
+        "confidence": confidence,
+        "fund_boost": fund_boost
     }
 
 # ============================================================
@@ -478,7 +622,10 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             composite_score = calc_composite_score(vol_ratio, turnover, chg, close, ma20)
             stage_info = analyze_main_force_stage(vol_ratio, chg, turnover, close, ma20)
             price_levels = calc_price_levels(close, ma20, chg)
-            trend_info = predict_trend(composite_score, stage_info, chg)
+            
+            # 获取资金流向（用于走势预判）
+            fund_summary = get_fund_flow_summary(symbol)
+            trend_info = predict_trend(composite_score, stage_info, chg, fund_summary)
 
             if enable_rush:
                 if symbol not in rush_cache:
@@ -654,7 +801,7 @@ def render_yesterday_review():
             st.info("📊 今日与昨日无重叠股票")
 
 # ============================================================
-# 股票详情页
+# 股票详情页（含资金流向）
 # ============================================================
 def render_stock_detail(symbol: str):
     df_result, _ = load_last_results()
@@ -670,12 +817,23 @@ def render_stock_detail(symbol: str):
     row = stock_row.iloc[0]
 
     st.subheader(f"📊 {row['名称']}（{row['代码']}）详细分析")
+    
+    # 返回按钮
+    if st.button("← 返回列表"):
+        st.session_state["selected_stock"] = None
+        st.rerun()
+    
+    st.divider()
 
+    # 基本信息
     col1, col2, col3 = st.columns(3)
     col1.metric("最新价", f"{row['最新价']} 元", delta=f"{row['涨跌幅%']:+.2f}%")
     col2.metric("综合评分", f"{row['综合评分']} 分", delta="满分100分")
     col3.metric("主力阶段", row.get("主力阶段", "-"))
 
+    st.divider()
+
+    # 价格参考
     st.subheader("💰 价格参考")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("建议购入价", f"{row.get('建议购入价', '-')} 元")
@@ -683,6 +841,9 @@ def render_stock_detail(symbol: str):
     col3.metric("目标价", f"{row.get('目标价', '-')} 元")
     col4.metric("支撑位", f"{row.get('支撑位', '-')} 元")
 
+    st.divider()
+
+    # 走势预判
     st.subheader("🔮 走势预判")
     trend = row.get("走势预判", "-")
     suggestion = row.get("操作建议", "-")
@@ -696,11 +857,17 @@ def render_stock_detail(symbol: str):
         st.info(f"**{trend}** | **{suggestion}**")
     st.caption(f"📝 {reason}")
 
+    st.divider()
+
+    # 主力阶段分析
     st.subheader("📈 主力阶段分析")
     st.info(f"**{row.get('主力阶段', '-')}**")
     st.caption(f"📝 {row.get('阶段详情', '-')}")
     st.caption(f"信心度：{row.get('信心度', '-')}")
 
+    st.divider()
+
+    # 技术指标
     st.subheader("📊 技术指标")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("量比", row.get("量比", "-"))
@@ -713,7 +880,75 @@ def render_stock_detail(symbol: str):
     else:
         st.caption(f"抢筹状态：{row.get('抢筹', '-')}")
 
-    if st.button("← 返回列表"):
+    st.divider()
+
+    # ============================================================
+    # 新增：近10日机构、大户资金流向
+    # ============================================================
+    st.subheader("💰 近10日资金流向")
+
+    with st.spinner("正在获取资金流向数据..."):
+        fund_data = get_fund_flow_summary(str(symbol))
+
+    if fund_data.get("has_data", False):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            inst = fund_data["institution"]
+            st.markdown(f"""
+            <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;">
+                <h4 style="margin:0 0 8px 0;">🏦 机构资金</h4>
+                <table style="width:100%;border-collapse:collapse;">
+                    <tr><td style="padding:4px 0;">流入</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#52c41a;">{inst['流入']:.2f} 亿</td></tr>
+                    <tr><td style="padding:4px 0;">流出</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#ff4d4f;">{inst['流出']:.2f} 亿</td></tr>
+                    <tr><td style="padding:4px 0;border-top:1px solid #e0e0e0;">净额</td>
+                        <td style="padding:4px 0;text-align:right;font-weight:bold;border-top:1px solid #e0e0e0;color:{'#52c41a' if inst['净额'] >= 0 else '#ff4d4f'};">{inst['color']} {inst['净额']:+.2f} 亿</td></tr>
+                    <tr><td style="padding:4px 0;">状态</td>
+                        <td style="padding:4px 0;text-align:right;font-weight:bold;color:{'#52c41a' if inst['净额'] >= 0 else '#ff4d4f'};">{inst['status']}</td></tr>
+                </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col2:
+            big = fund_data["big_trader"]
+            st.markdown(f"""
+            <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;">
+                <h4 style="margin:0 0 8px 0;">👤 大户资金</h4>
+                <table style="width:100%;border-collapse:collapse;">
+                    <tr><td style="padding:4px 0;">流入</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#52c41a;">{big['流入']:.2f} 亿</td></tr>
+                    <tr><td style="padding:4px 0;">流出</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#ff4d4f;">{big['流出']:.2f} 亿</td></tr>
+                    <tr><td style="padding:4px 0;border-top:1px solid #e0e0e0;">净额</td>
+                        <td style="padding:4px 0;text-align:right;font-weight:bold;border-top:1px solid #e0e0e0;color:{'#52c41a' if big['净额'] >= 0 else '#ff4d4f'};">{big['color']} {big['净额']:+.2f} 亿</td></tr>
+                    <tr><td style="padding:4px 0;">状态</td>
+                        <td style="padding:4px 0;text-align:right;font-weight:bold;color:{'#52c41a' if big['净额'] >= 0 else '#ff4d4f'};">{big['status']}</td></tr>
+                </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.caption(f"📌 数据来源：{fund_data.get('source', '龙虎榜')} | 近10日统计")
+        
+        # 综合资金判断
+        inst_net = fund_data["institution"]["净额"]
+        big_net = fund_data["big_trader"]["净额"]
+        
+        if inst_net > 0 and big_net > 0:
+            st.success("✅ 机构和大户均呈净流入，主力看好该股")
+        elif inst_net > 0 and big_net < 0:
+            st.warning("⚠️ 机构净流入但大户净流出，存在分歧")
+        elif inst_net < 0 and big_net > 0:
+            st.warning("⚠️ 大户净流入但机构净流出，需谨慎")
+        elif inst_net < 0 and big_net < 0:
+            st.error("❌ 机构和大户均呈净流出，主力可能撤离")
+        else:
+            st.info("ℹ️ 机构和大户资金流向不明确，建议观望")
+
+    else:
+        st.info(f"ℹ️ {fund_data.get('message', '暂无数据')}")
+
+    st.divider()
+    
+    # 返回按钮（底部）
+    if st.button("← 返回列表", use_container_width=True):
         st.session_state["selected_stock"] = None
         st.rerun()
 
