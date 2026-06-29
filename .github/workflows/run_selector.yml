@@ -1,0 +1,33 @@
+name: 尾盘选股定时任务
+
+on:
+  schedule:
+    - cron: '50 6 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run_selector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 执行选股并推送
+        env:
+          WECOM_CORPID: ${{ secrets.WECOM_CORPID }}
+          WECOM_AGENTID: ${{ secrets.WECOM_AGENTID }}
+          WECOM_SECRET: ${{ secrets.WECOM_SECRET }}
+        run: |
+          python headless_runner.py
