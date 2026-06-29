@@ -61,13 +61,13 @@ def from_alphafeed_symbol(af_symbol: str) -> str:
 @st.cache_resource
 def get_config():
     return {
-        "pct_min": 2.0,
-        "pct_max": 7.0,
-        "vol_ratio_min": 1.2,
-        "turnover_min": 3.0,
-        "turnover_max": 15.0,
-        "amount_min": 1e8,
-        "max_stocks": 30,
+        "pct_min": st.session_state.get("cfg_pct_min", 2.0),
+        "pct_max": st.session_state.get("cfg_pct_max", 7.0),
+        "vol_ratio_min": st.session_state.get("cfg_vol_ratio_min", 1.2),
+        "turnover_min": st.session_state.get("cfg_turnover_min", 3.0),
+        "turnover_max": st.session_state.get("cfg_turnover_max", 15.0),
+        "amount_min": st.session_state.get("cfg_amount_min", 1e8),
+        "max_stocks": st.session_state.get("cfg_max_stocks", 30),
         "cache_ttl": 600,
         "wecom": {
             "corpid": "wwab9a5075f240347d",
@@ -908,6 +908,17 @@ def main_page():
         else:
             st.warning("⚠️ 今日非交易日")
 
+        st.subheader("📊 筛选条件")
+        pct_min = st.slider("涨跌幅下限 (%)", 0.0, 10.0, 2.0, 0.5, key="cfg_pct_min")
+        pct_max = st.slider("涨跌幅上限 (%)", 0.0, 10.0, 7.0, 0.5, key="cfg_pct_max")
+        vol_ratio_min = st.slider("量比下限", 0.5, 5.0, 1.2, 0.1, key="cfg_vol_ratio_min")
+        turnover_min = st.slider("换手率下限 (%)", 0.0, 30.0, 3.0, 0.5, key="cfg_turnover_min")
+        turnover_max = st.slider("换手率上限 (%)", 0.0, 30.0, 15.0, 0.5, key="cfg_turnover_max")
+        amount_min = st.number_input("成交额下限 (亿)", 0.0, 10.0, 1.0, 0.5, key="cfg_amount_min_raw")
+        st.session_state["cfg_amount_min"] = amount_min * 1e8
+
+        st.divider()
+
         enable_rush = st.checkbox(
             "🔍 启用尾盘抢筹分析",
             value=tail_time and trading_day,
@@ -916,7 +927,7 @@ def main_page():
         if not (tail_time and trading_day):
             st.caption("ℹ️ 抢筹分析已禁用（非尾盘时段）")
 
-        max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 30, 5)
+        max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 30, 5, key="cfg_max_stocks")
 
         st.divider()
         wecom = get_config().get("wecom", {})
