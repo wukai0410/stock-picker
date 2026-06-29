@@ -7,7 +7,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import akshare as ak
-from datetime import datetime, time
+from datetime import datetime, time, timezone, timedelta
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -23,6 +23,15 @@ st.set_page_config(
 )
 
 # ============================================================
+# 时区定义 — 东八区（北京时间）
+# ============================================================
+CST = timezone(timedelta(hours=8))
+
+def beijing_now() -> datetime:
+    """返回北京时间 now"""
+    return datetime.now(CST)
+
+# ============================================================
 # 全局常量
 # ============================================================
 TAIL_SESSION_START = time(14, 30)  # 尾盘开始时间
@@ -31,7 +40,7 @@ DISPLAY_START = time(14, 50)       # 刷新展示时间
 
 def get_cache_ttl() -> int:
     """尾盘时段 TTL=600s，非尾盘 TTL=3600s"""
-    now = datetime.now().time()
+    now = beijing_now().time()
     if TAIL_SESSION_START <= now <= time(15, 0):
         return 600
     return 3600
@@ -91,7 +100,7 @@ def fetch_historical_kline(symbol: str, period: int = 30):
     try:
         # symbol 格式: "000001" → 需要补全为 "sz000001" 或 "sh000001"
         code = _format_code(symbol)
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=(datetime.now() - pd.Timedelta(days=60)).strftime("%Y%m%d"), end_date=datetime.now().strftime("%Y%m%d"), adjust="qfq")
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=(beijing_now() - pd.Timedelta(days=60)).strftime("%Y%m%d"), end_date=beijing_now().strftime("%Y%m%d"), adjust="qfq")
         if df.empty or "收盘" not in df.columns:
             return None
         closes = df["收盘"].tail(period)
@@ -292,7 +301,7 @@ def calc_intraday_rush(symbol: str, close: float) -> dict:
     分时抢筹识别
     返回: {"is_rush": bool, "score_delta": int, "slope_factor": float, "label": str}
     """
-    now = datetime.now().time()
+    now = beijing_now().time()
     if not (TAIL_SESSION_START <= now <= time(15, 0)):
         return {"is_rush": False, "score_delta": 0, "slope_factor": 0.0, "label": "非尾盘"}
 
@@ -512,7 +521,7 @@ def run_selection(pct_min: float, pct_max: float, turnover_min: float, turnover_
 def save_results(df: pd.DataFrame):
     """保存选股结果到 session_state"""
     st.session_state["cached_picks"] = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": beijing_now().isoformat(),
         "data": df.to_dict(orient="records"),
     }
 
@@ -565,7 +574,7 @@ def main():
             st.rerun()
 
     # ---- 时间判断 ----
-    now = datetime.now()
+    now = beijing_now()
     current_time = now.time()
     is_tail_session = current_time >= DISPLAY_START and current_time <= time(15, 0)
 
