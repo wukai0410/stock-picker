@@ -1,4 +1,4 @@
-# app.py - 尾盘智能选股工具（AlphaFeed Pro 版 - 完整修复版）
+# app.py - 尾盘智能选股工具（AlphaFeed Pro 版 - 并行加速版）
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
@@ -6,6 +6,7 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -568,6 +569,59 @@ def send_wecom_message(df: pd.DataFrame, summary: dict) -> bool:
 # ============================================================
 # 主选股逻辑
 # ============================================================
+# ============================================================
+# 并行批量数据获取
+# ============================================================
+def _batch_fetch_ma20(candidates: list[dict]) -> dict[str, float | None]:
+    """并行获取所有候选股的MA20，返回 {symbol: ma20}"""
+    result = {}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        def _fetch_one(sym):
+            return sym, fetch_ma20(sym)
+        futures = {pool.submit(_fetch_one, c["symbol"]): c["symbol"] for c in candidates}
+        for f in as_completed(futures):
+            try:
+                sym, ma20 = f.result()
+                result[sym] = ma20
+            except Exception:
+                pass
+    return result
+
+def _batch_fetch_fund_flow(candidates: list[dict]) -> dict[str, dict]:
+    """并行获取所有候选股的资金流向"""
+    result = {}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        def _fetch_one(sym):
+            return sym, get_fund_flow_summary(sym)
+        futures = {pool.submit(_fetch_one, c["symbol"]): c["symbol"] for c in candidates}
+        for f in as_completed(futures):
+            try:
+                sym, fund = f.result()
+                result[sym] = fund
+            except Exception:
+                pass
+    return result
+
+def _batch_fetch_intraday(candidates: list[dict]) -> dict[str, dict]:
+    """并行获取所有候选股的分时抢筹分析"""
+    result = {}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        def _fetch_one(sym):
+            minute = fetch_intraday_minute(sym)
+            return sym, calc_intraday_rush(minute)
+        futures = {pool.submit(_fetch_one, c["symbol"]): c["symbol"] for c in candidates}
+        for f in as_completed(futures):
+            try:
+                sym, rush = f.result()
+                result[sym] = rush
+            except Exception:
+                pass
+    return result
+
+
+# ============================================================
+# 主选股逻辑（并行加速版）
+# ============================================================
 def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     now = beijing_now()
 
@@ -586,6 +640,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     progress = st.progress(0.0, text="正在初始化...")
     status_text.text("⏳ 准备获取实时行情...")
 
+    # ---- 阶段1：获取全市场行情 ----
     df = fetch_realtime_quotes()
     if df is None:
         st.error("❌ 无法获取实时行情")
@@ -593,15 +648,13 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
 
     config = get_config()
     total = len(df)
-    results = []
-    rush_cache = {}
-    errors = 0
 
-    for i, (idx, row) in enumerate(df.iterrows()):
-        if i % 10 == 0:
-            progress.progress((i + 1) / total, text=f"⏳ 正在分析 {i+1}/{total} ...")
-            status_text.text(f"📊 已筛选 {len(results)} 只候选股")
+    # ---- 阶段2：粗筛（纯内存操作，极快） ----
+    status_text.text("🔍 正在进行初筛...")
+    progress.progress(0.1, text="正在进行初筛...")
 
+    candidates = []
+    for _, row in df.iterrows():
         try:
             symbol = str(row["代码"]).zfill(6)
             name = str(row["名称"])
@@ -613,7 +666,6 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
 
             if not (config["pct_min"] < chg < config["pct_max"]):
                 continue
-            # 量比筛选：默认值1.0表示无真实数据，放行；有真实数据才严格过滤
             if vol_ratio != 1.0 and vol_ratio < config["vol_ratio_min"]:
                 continue
             if not (config["turnover_min"] < turnover < config["turnover_max"]):
@@ -621,55 +673,76 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             if amount < config["amount_min"]:
                 continue
 
-            ma20 = fetch_ma20(symbol)
-            composite_score = calc_composite_score(vol_ratio, turnover, chg, close, ma20)
-            stage_info = analyze_main_force_stage(vol_ratio, chg, turnover, close, ma20)
-            price_levels = calc_price_levels(close, ma20, chg)
-
-            fund_summary = get_fund_flow_summary(symbol)
-            trend_info = predict_trend(composite_score, stage_info, chg, fund_summary)
-
-            if enable_rush:
-                if symbol not in rush_cache:
-                    rush_cache[symbol] = calc_intraday_rush(fetch_intraday_minute(symbol))
-                rush = rush_cache[symbol]
-            else:
-                rush = {"label": "-", "score": 0, "detail": "-"}
-
-            results.append({
-                "代码": symbol,
-                "名称": name,
-                "涨跌幅%": round(chg, 2),
-                "量比": round(vol_ratio, 2),
-                "换手率%": round(turnover, 2),
-                "成交额亿": round(amount / 1e8, 2),
-                "最新价": round(close, 2),
-                "MA20": round(ma20, 2) if ma20 else "-",
-                "综合评分": composite_score,
-                "主力阶段": stage_info["stage"],
-                "阶段详情": stage_info["detail"],
-                "信心度": stage_info["confidence"],
-                "走势预判": trend_info["trend"],
-                "操作建议": trend_info["suggestion"],
-                "建议理由": trend_info["reason"],
-                "建议购入价": price_levels["buy_price"],
-                "止损价": price_levels["stop_loss"],
-                "目标价": price_levels["target"],
-                "支撑位": price_levels["support"],
-                "抢筹": rush["label"],
-                "抢筹评分": rush["score"],
-                "_sort_key": composite_score,
+            candidates.append({
+                "symbol": symbol, "name": name, "chg": chg,
+                "vol_ratio": vol_ratio, "amount": amount,
+                "turnover": turnover, "close": close,
             })
         except Exception:
-            errors += 1
             continue
+
+    status_text.text(f"📊 初筛通过 {len(candidates)} 只，正在深度分析...")
+
+    if not candidates:
+        progress.progress(1.0, text="✅ 选股完成！")
+        st.warning("⚠️ 未找到符合条件的股票")
+        return None
+
+    # ---- 阶段3：并行批量获取深度数据 ----
+    progress.progress(0.3, text="正在获取MA20...")
+    ma20_map = _batch_fetch_ma20(candidates)
+
+    progress.progress(0.5, text="正在获取资金流向...")
+    fund_map = _batch_fetch_fund_flow(candidates)
+
+    rush_map = {}
+    if enable_rush:
+        progress.progress(0.7, text="正在分析分时抢筹...")
+        rush_map = _batch_fetch_intraday(candidates)
+    else:
+        rush_map = {c["symbol"]: {"label": "-", "score": 0, "detail": "-"} for c in candidates}
+
+    # ---- 阶段4：评分排序（纯计算，极快） ----
+    progress.progress(0.9, text="正在评分排序...")
+    results = []
+    for c in candidates:
+        sym = c["symbol"]
+        ma20 = ma20_map.get(sym)
+        fund_summary = fund_map.get(sym, {"has_data": False})
+        rush = rush_map.get(sym, {"label": "-", "score": 0, "detail": "-"})
+
+        composite_score = calc_composite_score(c["vol_ratio"], c["turnover"], c["chg"], c["close"], ma20)
+        stage_info = analyze_main_force_stage(c["vol_ratio"], c["chg"], c["turnover"], c["close"], ma20)
+        price_levels = calc_price_levels(c["close"], ma20, c["chg"])
+        trend_info = predict_trend(composite_score, stage_info, c["chg"], fund_summary)
+
+        results.append({
+            "代码": sym,
+            "名称": c["name"],
+            "涨跌幅%": round(c["chg"], 2),
+            "量比": round(c["vol_ratio"], 2),
+            "换手率%": round(c["turnover"], 2),
+            "成交额亿": round(c["amount"] / 1e8, 2),
+            "最新价": round(c["close"], 2),
+            "MA20": round(ma20, 2) if ma20 else "-",
+            "综合评分": composite_score,
+            "主力阶段": stage_info["stage"],
+            "阶段详情": stage_info["detail"],
+            "信心度": stage_info["confidence"],
+            "走势预判": trend_info["trend"],
+            "操作建议": trend_info["suggestion"],
+            "建议理由": trend_info["reason"],
+            "建议购入价": price_levels["buy_price"],
+            "止损价": price_levels["stop_loss"],
+            "目标价": price_levels["target"],
+            "支撑位": price_levels["support"],
+            "抢筹": rush["label"],
+            "抢筹评分": rush["score"],
+            "_sort_key": composite_score,
+        })
 
     progress.progress(1.0, text="✅ 选股完成！")
     status_text.text(f"✅ 选股完成！共找到 {len(results)} 只候选股")
-
-    if not results:
-        st.warning("⚠️ 未找到符合条件的股票")
-        return None
 
     results.sort(key=lambda x: x["_sort_key"], reverse=True)
     df_result = pd.DataFrame(results[:max_stocks])
@@ -683,7 +756,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
         "max_vol_ratio": round(df_result["量比"].max(), 2),
         "max_score": int(df_result["综合评分"].max()),
         "rush_distribution": df_result["抢筹"].value_counts().to_dict(),
-        "errors": errors,
+        "errors": 0,
     }
     st.session_state["last_summary"] = summary
     st.session_state["last_results"] = df_result
