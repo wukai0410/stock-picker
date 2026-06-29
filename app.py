@@ -352,7 +352,14 @@ def calc_intraday_rush(symbol: str, close: float) -> dict:
     # 判断抢筹 vs 诱多
     # 斜率平缓 (slope_normalized < 0.05 可视为 45 度推升) 且 最后5分钟占比 < 60%
     if slope_normalized < 0.08 and last5_ratio < 0.6:
-        return {"is_rush": True, "score_delta": 10, "slope_factor": slope_factor, "label": "真抢筹"}
+        # 真抢筹 — 按斜率绝对值和持续比例判断强度
+        if slope_normalized >= 0.05 and last5_ratio <= 0.4:
+            strength = "强"
+        elif slope_normalized >= 0.03 or last5_ratio <= 0.5:
+            strength = "中"
+        else:
+            strength = "弱"
+        return {"is_rush": True, "score_delta": 10, "slope_factor": slope_factor, "label": f"真抢筹({strength})"}
     # 斜率陡峭 (slope_normalized >= 0.12 可视为 80 度拉升) 且 最后5分钟占比 >= 60%
     elif slope_normalized >= 0.12 and last5_ratio >= 0.6:
         return {"is_rush": False, "score_delta": -10, "slope_factor": slope_factor, "label": "诱多嫌疑"}
@@ -412,7 +419,7 @@ def _fetch_a50_night_change() -> float:
 def run_selection(pct_min: float, pct_max: float, turnover_min: float, turnover_max: float, enable_rush: bool = False) -> pd.DataFrame:
     """执行完整选股流程"""
     # Step 1: 获取实时行情
-    with st.spinner("正在获取全 A 股实时行情..."):
+    with st.spinner("⏰ 尾盘时段已到，正在运行选股逻辑，请稍候..."):
         df_raw = fetch_realtime_quotes()
 
     if df_raw.empty:
@@ -434,6 +441,17 @@ def run_selection(pct_min: float, pct_max: float, turnover_min: float, turnover_
     if df_core.empty:
         st.warning("核心筛选后无符合条件股票。")
         return pd.DataFrame()
+
+    # 按量比降序排序，只取前 30 只进入深度分析
+    col_map_pre = _detect_columns(df_core)
+    vol_ratio_col_pre = None
+    for c in df_core.columns:
+        if "量比" in c:
+            vol_ratio_col_pre = c
+            break
+    if vol_ratio_col_pre and len(df_core) > 30:
+        df_core = df_core.sort_values(vol_ratio_col_pre, ascending=False).head(30).reset_index(drop=True)
+        st.info("⚡ 候选股较多，已按量比排序取前 30 只")
 
     col_map = _detect_columns(df_core)
 
@@ -479,7 +497,7 @@ def run_selection(pct_min: float, pct_max: float, turnover_min: float, turnover_
         if enable_rush:
             pressure = calc_pressure_test(close, rush["slope_factor"])
         else:
-            pressure = {"premium": "未开启测压", "pl_ratio": "-", "a50_pct": "-"}
+            pressure = {"premium": "-", "pl_ratio": "-", "a50_pct": "-"}
 
         # 东财链接
         link = f"https://quote.eastmoney.com/concept/{code}.html"
@@ -500,10 +518,11 @@ def run_selection(pct_min: float, pct_max: float, turnover_min: float, turnover_
             }
         )
 
-        # 更新进度
-        progress = (idx + 1) / total
-        progress_bar.progress(progress)
-        status_text.text(f"分析进度: {idx + 1}/{total}")
+        # 每 5 只更新一次进度，减少 UI 重绘
+        if (idx + 1) % 5 == 0 or (idx + 1) == total:
+            progress = (idx + 1) / total
+            progress_bar.progress(progress)
+            status_text.text(f"分析进度: {idx + 1}/{total}")
 
     progress_bar.empty()
     status_text.empty()
@@ -527,15 +546,15 @@ def save_results(df: pd.DataFrame):
     }
 
 
-def load_results() -> pd.DataFrame | None:
-    """从 session_state 加载上次保存的结果"""
+def load_results() -> tuple[pd.DataFrame | None, str | None]:
+    """从 session_state 加载上次保存的结果，返回 (df, timestamp)"""
     cached = st.session_state.get("cached_picks")
     if cached is None:
-        return None
+        return None, None
     try:
-        return pd.DataFrame(cached["data"])
+        return pd.DataFrame(cached["data"]), cached.get("timestamp")
     except Exception:
-        return None
+        return None, None
 
 
 # ============================================================
@@ -569,6 +588,13 @@ def main():
         enable_rush_detection = st.checkbox("开启抢筹识别（耗时较长）", value=False)
         st.caption(f"数据缓存: 10分钟（点击下方按钮手动刷新）")
         st.caption(f"尾盘时段: {TAIL_SESSION_START.strftime('%H:%M')} - 15:00")
+        # 时段提示
+        _sidebar_now = beijing_now().time()
+        _is_tail = DISPLAY_START <= _sidebar_now <= time(15, 0)
+        if _is_tail:
+            st.success("✅ 尾盘时段，调整滑块后自动刷新结果")
+        else:
+            st.warning("⚠️ 当前非尾盘时段，滑块调整不影响展示结果")
 
         if st.button("🔄 手动刷新数据", use_container_width=True):
             st.cache_data.clear()
@@ -585,9 +611,15 @@ def main():
             f"⏰ 当前时间 {current_time.strftime('%H:%M')}，非尾盘时段（尾盘展示时间 ≥ {DISPLAY_START.strftime('%H:%M')}），"
             "以下为最近一次保存的选股结果，仅供参考。"
         )
-        cached = load_results()
+        cached, cached_ts = load_results()
         if cached is not None and not cached.empty:
             df_result = cached
+            if cached_ts:
+                try:
+                    ts_display = datetime.fromisoformat(cached_ts).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    ts_display = cached_ts
+                st.caption(f"📅 数据生成时间：{ts_display}（北京时间）")
         else:
             st.warning("暂无历史选股结果。请等待尾盘时段自动生成。")
             _render_footer()
@@ -608,6 +640,17 @@ def main():
 
     # 构建可点击表格
     _render_clickable_table(df_result)
+
+    # 导出 CSV 按钮
+    export_cols = ["股票名称", "代码", "收盘价", "涨幅(%)", "换手率(%)", "量比", "综合评分", "抢筹标记", "预期开盘溢价(%)", "盈亏比"]
+    export_df = df_result[[c for c in export_cols if c in df_result.columns]]
+    csv_data = export_df.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        label="📥 导出 CSV",
+        data=csv_data,
+        file_name=f"选股结果_{beijing_now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+    )
 
     # ---- 风险提示 ----
     _render_footer()
@@ -639,7 +682,12 @@ def _render_clickable_table(df: pd.DataFrame):
                 html += f"<td style='padding:8px;border-bottom:1px solid #eee;text-align:center;font-weight:bold;color:{color};'>{score}</td>"
             elif col == "抢筹标记":
                 label = str(val)
-                label_color = "#52c41a" if label == "真抢筹" else ("#ff4d4f" if label == "诱多嫌疑" else "#999")
+                if label.startswith("真抢筹"):
+                    label_color = "#52c41a"
+                elif label == "诱多嫌疑":
+                    label_color = "#ff4d4f"
+                else:
+                    label_color = "#999"
                 html += f"<td style='padding:8px;border-bottom:1px solid #eee;text-align:center;color:{label_color};font-weight:bold;'>{label}</td>"
             elif col in ("涨幅(%)",):
                 val_num = float(val) if val != "-" else 0
