@@ -182,6 +182,14 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     """执行完整选股流程"""
     progress = st.progress(0.0, text="⏰ 尾盘时段已到，正在运行选股逻辑，请稍候...")
     status_text = st.empty()
+
+    # 判断是否尾盘时段，非尾盘自动禁用抢筹分析
+    now = beijing_now()
+    is_tail_session = now.hour >= 14 and now.hour < 16
+    if not is_tail_session:
+        enable_rush = False
+        st.info("ℹ️ 当前非尾盘时段，抢筹分析已自动跳过")
+
     df = fetch_realtime_quotes()
     if df is None:
         st.error("无法获取实时行情，请稍后重试")
@@ -298,7 +306,7 @@ def render_summary_panel():
     cols[4].metric("🔥 最大量比", summary["max_vol_ratio"])
     cols[5].metric("⚠️ 数据异常", summary["errors"])
     if summary.get("rush_distribution"):
-        rush_str = ", ".join([f"{k}:{v}" for k, v in summary["rush_distribution"].items()])
+        rush_str = " | ".join([f"{k}:{v}" for k, v in summary["rush_distribution"].items()])
         st.caption(f"🏷️ 抢筹分布：{rush_str}")
 
 def render_yesterday_review():
@@ -330,7 +338,12 @@ def render_yesterday_review():
         yesterday_codes = set(df_yesterday["代码"].astype(str))
         overlap = today_codes & yesterday_codes
         if overlap:
-            overlap_df = df_today[df_today["代码"].astype(str).isin(overlap)]
+            overlap_df = df_today[df_today["代码"].astype(str).isin(overlap)].copy()
+            # 抢筹标签前加 ⭐ 前缀
+            if "抢筹" in overlap_df.columns:
+                overlap_df["抢筹"] = overlap_df["抢筹"].apply(
+                    lambda x: f"⭐ {x}" if not str(x).startswith("⭐") else x
+                )
             st.success(f"⭐ 连续上榜：{len(overlap)} 只股票")
             st.dataframe(overlap_df[["代码", "名称", "涨跌幅%", "量比", "抢筹"]], use_container_width=True)
         else:
@@ -369,6 +382,12 @@ with st.sidebar:
     if st.button("🗑️ 清除缓存并刷新", use_container_width=True):
         st.cache_data.clear()
         st.session_state["last_summary"] = None
+        st.rerun()
+    if st.button("🗑️ 清空历史数据", use_container_width=True):
+        for key in ["history_results", "last_results", "last_results_ts", "last_summary"]:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.success("✅ 历史数据已清空")
         st.rerun()
     st.divider()
     st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
