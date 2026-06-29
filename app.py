@@ -1,9 +1,10 @@
-# app.py - 尾盘智能选股工具（完整修复版）
+# app.py - 尾盘智能选股工具（完整修复版 + 企业微信推送）
 # -*- coding: utf-8 -*-
 import streamlit as st
 import akshare as ak
 import pandas as pd
 import numpy as np
+import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import warnings
@@ -47,6 +48,13 @@ def get_config():
         "amount_min": 1e8,
         "max_stocks": 30,
         "cache_ttl": 600,
+        # 企业微信配置
+        "wecom": {
+            "corpid": "wwab9a5075f240347d",
+            "agentid": "1000002",
+            "secret": "jnwWrisTzy-ni2iFUOpdciihlGfs4DHQyhOqpj1AM_o",
+            "touser": "@all",
+        }
     }
 
 # ============================================================
@@ -154,6 +162,111 @@ def fetch_a50_change() -> float:
         return round((latest - prev) / prev * 100, 2)
     except Exception:
         return 0.0
+
+# ============================================================
+# 企业微信推送
+# ============================================================
+def get_wecom_access_token(corpid: str, secret: str) -> str | None:
+    """获取企业微信 access_token"""
+    try:
+        url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={corpid}&corpsecret={secret}"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        if data.get("errcode") == 0:
+            return data.get("access_token")
+        else:
+            st.warning(f"⚠️ 获取 access_token 失败: {data.get('errmsg', '未知错误')}")
+            return None
+    except Exception as e:
+        st.warning(f"⚠️ 获取 access_token 异常: {e}")
+        return None
+
+
+def send_wecom_message(df: pd.DataFrame, summary: dict) -> bool:
+    """发送选股结果到企业微信应用"""
+    if df is None or df.empty:
+        return False
+
+    config = get_config()
+    wecom = config.get("wecom", {})
+    corpid = wecom.get("corpid", "")
+    agentid = wecom.get("agentid", "")
+    secret = wecom.get("secret", "")
+    touser = wecom.get("touser", "@all")
+
+    if not all([corpid, agentid, secret]):
+        st.warning("⚠️ 企业微信配置不完整，请检查 corpid、agentid、secret")
+        return False
+
+    # 获取 access_token
+    token = get_wecom_access_token(corpid, secret)
+    if token is None:
+        return False
+
+    now = beijing_now()
+    top_stocks = df.head(5)
+
+    # 构建 Markdown 消息
+    msg_lines = [
+        f"📈 **尾盘智能选股结果**",
+        f"🕐 时间：{now.strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        f"📊 今日共筛选出 **{len(df)}** 只候选股",
+        f"📈 平均涨幅：**{summary.get('avg_pct', 0)}%**",
+        f"🔥 最大量比：**{summary.get('max_vol_ratio', 0)}**",
+        "",
+        "🏆 **TOP5 精选**",
+    ]
+
+    for i, (_, row) in enumerate(top_stocks.iterrows(), 1):
+        code = row.get("代码", "-")
+        name = row.get("名称", "-")
+        chg = row.get("涨跌幅%", 0)
+        vol = row.get("量比", 0)
+        rush = row.get("抢筹", "-")
+
+        if chg > 5:
+            emoji = "🚀"
+        elif chg > 3:
+            emoji = "🔥"
+        else:
+            emoji = "📌"
+
+        rush_emoji = "⭐" if "真抢筹" in str(rush) else ""
+
+        msg_lines.append(f"{i}. {emoji} **{name}**（{code}）")
+        msg_lines.append(f"   涨幅：{chg:+.2f}% ｜ 量比：{vol:.2f}")
+        if rush_emoji:
+            msg_lines.append(f"   {rush_emoji} 抢筹：{rush}")
+        else:
+            msg_lines.append(f"   抢筹：{rush}")
+
+    msg_lines.append("")
+    msg_lines.append("⚠️ *以上内容仅供参考，不构成投资建议*")
+
+    msg = "\n".join(msg_lines)
+
+    # 发送消息
+    try:
+        send_url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
+        payload = {
+            "touser": touser,
+            "msgtype": "markdown",
+            "agentid": int(agentid),
+            "markdown": {
+                "content": msg,
+            }
+        }
+        resp = requests.post(send_url, json=payload, timeout=10)
+        data = resp.json()
+        if data.get("errcode") == 0:
+            return True
+        else:
+            st.warning(f"⚠️ 消息发送失败: {data.get('errmsg', '未知错误')}")
+            return False
+    except Exception as e:
+        st.warning(f"⚠️ 消息发送异常: {e}")
+        return False
 
 # ============================================================
 # 选股逻辑
@@ -287,6 +400,18 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
         "errors": errors,
     }
     st.session_state["last_summary"] = summary
+
+    # ---- 企业微信推送 ----
+    try:
+        if df_result is not None and not df_result.empty:
+            success = send_wecom_message(df_result, summary)
+            if success:
+                st.toast("✅ 已推送到企业微信", icon="📱")
+            else:
+                st.toast("⚠️ 推送失败，请检查企业微信配置", icon="⚠️")
+    except Exception as e:
+        st.warning(f"⚠️ 推送异常: {e}")
+
     return df_result
 
 # ============================================================
@@ -438,6 +563,15 @@ with st.sidebar:
         else:
             st.caption("ℹ️ 抢筹分析：已禁用")
     max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 30, 5)
+
+    st.divider()
+    # ---- 企业微信状态 ----
+    wecom = get_config().get("wecom", {})
+    if wecom.get("corpid") and wecom.get("agentid") and wecom.get("secret"):
+        st.caption("📱 企业微信推送：已启用 ✅")
+    else:
+        st.caption("📱 企业微信推送：未配置 ⚠️")
+
     st.divider()
     # 运行按钮
     if st.button("🔄 运行选股", use_container_width=True, type="primary"):
