@@ -87,52 +87,95 @@ def fetch_realtime_quotes():
     返回统一列名：代码、名称、涨跌幅、量比、成交额、换手率、最新价
     """
     try:
-        # 全 A 股实时快照
-        df = af.quotes.get(universes="CN_Stock", to_dataframe=True)
-        if df is None or df.empty:
+        data = af.quotes.get(universes="CN_Stock")
+        if not data:
             st.error("❌ AlphaFeed 返回空数据")
             return None
 
-        # 展开 ext 字段（包含 name、change_pct、turnover、volume_ratio）
-        if "ext" in df.columns:
-            ext_df = pd.json_normalize(df["ext"])
-            df = pd.concat([df.drop(columns=["ext"]), ext_df], axis=1)
+        # 新版返回 list[dict]，手动构建 DataFrame
+        rows = []
+        for item in data:
+            ext = item.get("ext", {}) or {}
+            rows.append({
+                "symbol": item.get("symbol", ""),
+                "name": ext.get("name", ""),
+                "last_price": item.get("last_price"),
+                "prev_close": item.get("prev_close"),
+                "open": item.get("open"),
+                "high": item.get("high"),
+                "low": item.get("low"),
+                "amount": item.get("amount"),
+                "volume": item.get("volume"),
+                "change_pct": ext.get("change_pct"),
+                "change_amount": ext.get("change_amount"),
+                "turnover_rate": ext.get("turnover_rate"),
+                "amplitude": ext.get("amplitude"),
+            })
+        df = pd.DataFrame(rows)
 
-        # 重命名到统一列名
-        rename_map = {
-            "symbol": "代码",
-            "name": "名称",
-            "change_pct": "涨跌幅",
-            "volume_ratio": "量比",
-            "amount": "成交额",
-            "turnover": "换手率",
-            "last_price": "最新价",
-        }
-        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        if df.empty:
+            st.error("❌ AlphaFeed 数据解析后为空")
+            return None
 
-        required_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
-        for col in required_cols:
-            if col not in df.columns:
-                df[col] = None
+        # 代码处理：去掉后缀（688252.SH → 688252）
+        df["代码"] = df["symbol"].astype(str).str.replace(r"\.(SH|SZ|BJ)$", "", regex=True)
 
-        df = df[required_cols]
+        # 涨跌幅从小数转百分比（如 -0.0094 → -0.94%）
+        df["涨跌幅"] = pd.to_numeric(df["change_pct"], errors="coerce") * 100
 
-        # 数值转换
-        for col in ["涨跌幅", "量比", "成交额", "换手率", "最新价"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # 换手率也转百分比
+        df["换手率"] = pd.to_numeric(df["turnover_rate"], errors="coerce") * 100
 
-        # 涨跌幅从小数转百分比（AlphaFeed 返回 0.06 表示 6%）
-        if "涨跌幅" in df.columns:
-            df["涨跌幅"] = df["涨跌幅"] * 100
+        # 量比：AlphaFeed 没有直接提供，用当日成交量 / 5日均量估算
+        # 先保留原始成交量用于后续计算
+        df["_volume_raw"] = pd.to_numeric(df["volume"], errors="coerce")
+        df["量比"] = np.nan
 
-        # 删除空值行
+        df["成交额"] = pd.to_numeric(df["amount"], errors="coerce")
+        df["最新价"] = pd.to_numeric(df["last_price"], errors="coerce")
+        df["名称"] = df["name"].astype(str)
+
+        # 删除无效行
         df = df.dropna(subset=["代码", "最新价"])
+        df = df[df["代码"].str.match(r"^\d{6}$")]
 
-        return df
+        # 批量计算量比（前200只）
+        df["量比"] = _calc_volume_ratio(df)
+
+        return df[["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]]
 
     except Exception as e:
         st.error(f"❌ AlphaFeed 获取实时行情失败: {e}")
         return None
+
+
+def _calc_volume_ratio(df: pd.DataFrame) -> pd.Series:
+    """
+    批量计算量比：当日成交量 / 过去5日均量
+    AlphaFeed quotes 接口不直接提供量比，用 K线接口补
+    只对前200只股票计算（量比主要用于排序，不需要全市场精确）
+    """
+    result = pd.Series(np.nan, index=df.index)
+    sample = df.head(200)
+    for i, row in sample.iterrows():
+        try:
+            symbol = row["代码"]
+            today_vol = row.get("_volume_raw")
+            if today_vol is None or today_vol <= 0:
+                continue
+            af_symbol = to_alphafeed_symbol(symbol)
+            result = af.klines.get(af_symbol, period="1d", count=10, adjust="forward")
+            if not result or not isinstance(result, dict):
+                continue
+            if "volume" not in result or len(result["volume"]) < 6:
+                continue
+            vols = pd.Series(result["volume"]).tail(6)
+            avg_vol_5d = vols.head(5).mean()
+            if avg_vol_5d > 0:
+                result.at[i] = round(today_vol / avg_vol_5d, 2)
+        except Exception:
+            continue
+    return result
 
 
 @st.cache_data(ttl=600)
@@ -140,21 +183,23 @@ def fetch_ma20(symbol: str) -> float | None:
     """获取个股20日均线"""
     try:
         af_symbol = to_alphafeed_symbol(symbol)
-        df = af.klines.get(
+        result = af.klines.get(
             af_symbol,
             period="1d",
             count=300,
             adjust="forward",
-            to_dataframe=True,
         )
-        if df is None or df.empty:
+        if not result or not isinstance(result, dict):
             return None
-        df = df.sort_values("trade_date").reset_index(drop=True)
-        closes = df["close"].dropna()
+        # 新版返回 dict of lists（列式）
+        if "close" in result:
+            closes = pd.Series(result["close"]).dropna()
+        else:
+            return None
         if len(closes) < 20:
             return None
         return closes.tail(20).mean()
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -163,15 +208,20 @@ def fetch_intraday_minute(symbol: str):
     """获取当日1分钟分时数据"""
     try:
         af_symbol = to_alphafeed_symbol(symbol)
-        df = af.klines.intraday(
+        result = af.klines.intraday(
             af_symbol,
             period="1m",
-            to_dataframe=True,
         )
-        if df is None or df.empty:
+        if not result or not isinstance(result, dict):
             return None
-        df = df.sort_values("trade_time").reset_index(drop=True)
-        return df
+        # 新版返回 dict of lists（列式）
+        if "close" in result and "volume" in result:
+            df = pd.DataFrame({
+                "close": result["close"],
+                "volume": result["volume"],
+            })
+            return df
+        return None
     except Exception:
         return None
 
