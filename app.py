@@ -1,4 +1,4 @@
-# app.py - 尾盘智能选股工具（完整修复版 + 企业微信推送）
+# app.py - 尾盘智能选股工具（完整版：综合评分 + 详情页 + 主力分析 + 企业微信推送）
 # -*- coding: utf-8 -*-
 import streamlit as st
 import akshare as ak
@@ -22,7 +22,6 @@ def today_str() -> str:
     return beijing_now().strftime("%Y-%m-%d")
 
 def is_tail_time() -> bool:
-    """判断当前是否处于尾盘时段（14:30:00 <= time <= 15:00:00）"""
     now = beijing_now()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     tail_start = today.replace(hour=14, minute=30, second=0)
@@ -30,7 +29,6 @@ def is_tail_time() -> bool:
     return tail_start <= now <= tail_end
 
 def is_trading_day() -> bool:
-    """判断今天是否为交易日（简单判断：周一至周五）"""
     now = beijing_now()
     return now.weekday() < 5
 
@@ -48,7 +46,6 @@ def get_config():
         "amount_min": 1e8,
         "max_stocks": 30,
         "cache_ttl": 600,
-        # 企业微信配置
         "wecom": {
             "corpid": "wwab9a5075f240347d",
             "agentid": "1000002",
@@ -75,7 +72,6 @@ def _get_column(df: pd.DataFrame, candidates: list) -> str | None:
 # ============================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_realtime_quotes():
-    """获取实时行情数据（带重试和列名兼容性检查）"""
     import time
     last_err = None
     for attempt in range(3):
@@ -103,7 +99,6 @@ def fetch_realtime_quotes():
             required_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
             missing = [c for c in required_cols if c not in df.columns]
             if missing:
-                st.warning(f"⚠️ 数据源列名不匹配，缺失: {missing}。尝试自动适配...")
                 for col in df.columns:
                     for req in required_cols:
                         if req in col or col in req:
@@ -111,7 +106,6 @@ def fetch_realtime_quotes():
                             break
                 missing = [c for c in required_cols if c not in df.columns]
                 if missing:
-                    st.error(f"❌ 无法识别必要列: {missing}，请检查 akshare 版本")
                     return None
             numeric_cols = ["涨跌幅", "量比", "成交额", "换手率", "最新价"]
             for col in numeric_cols:
@@ -122,12 +116,10 @@ def fetch_realtime_quotes():
             last_err = e
             if attempt < 2:
                 time.sleep(1.5 * (attempt + 1))
-    st.error(f"获取实时行情失败（重试3次）: {last_err}")
     return None
 
 @st.cache_data(ttl=60)
 def fetch_intraday_minute(symbol: str):
-    """获取当日1分钟分时数据（仅保留已知可用接口）"""
     try:
         df = ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")
         if df is None or df.empty:
@@ -145,7 +137,6 @@ def fetch_intraday_minute(symbol: str):
 
 @st.cache_data(ttl=300)
 def fetch_a50_change() -> float:
-    """获取富时A50涨跌幅（仅保留期货接口）"""
     try:
         df = ak.futures_zh_minute_sina(symbol="A50")
         if df is None or df.empty or len(df) < 2:
@@ -163,116 +154,156 @@ def fetch_a50_change() -> float:
     except Exception:
         return 0.0
 
-# ============================================================
-# 企业微信推送
-# ============================================================
-def get_wecom_access_token(corpid: str, secret: str) -> str | None:
-    """获取企业微信 access_token"""
+@st.cache_data(ttl=600)
+def fetch_ma20(symbol: str) -> float | None:
     try:
-        url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={corpid}&corpsecret={secret}"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get("errcode") == 0:
-            return data.get("access_token")
-        else:
-            st.warning(f"⚠️ 获取 access_token 失败: {data.get('errmsg', '未知错误')}")
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq", start_date="20240101")
+        if df is None or df.empty:
             return None
-    except Exception as e:
-        st.warning(f"⚠️ 获取 access_token 异常: {e}")
+        close_col = _get_column(df, ["收盘", "close"])
+        if close_col is None:
+            return None
+        closes = pd.to_numeric(df[close_col], errors="coerce").dropna()
+        if len(closes) < 20:
+            return None
+        return closes.tail(20).mean()
+    except Exception:
         return None
 
-
-def send_wecom_message(df: pd.DataFrame, summary: dict) -> bool:
-    """发送选股结果到企业微信应用"""
-    if df is None or df.empty:
-        return False
-
-    config = get_config()
-    wecom = config.get("wecom", {})
-    corpid = wecom.get("corpid", "")
-    agentid = wecom.get("agentid", "")
-    secret = wecom.get("secret", "")
-    touser = wecom.get("touser", "@all")
-
-    if not all([corpid, agentid, secret]):
-        st.warning("⚠️ 企业微信配置不完整，请检查 corpid、agentid、secret")
-        return False
-
-    # 获取 access_token
-    token = get_wecom_access_token(corpid, secret)
-    if token is None:
-        return False
-
-    now = beijing_now()
-    top_stocks = df.head(5)
-
-    # 构建 Markdown 消息
-    msg_lines = [
-        f"📈 **尾盘智能选股结果**",
-        f"🕐 时间：{now.strftime('%Y-%m-%d %H:%M:%S')}",
-        "",
-        f"📊 今日共筛选出 **{len(df)}** 只候选股",
-        f"📈 平均涨幅：**{summary.get('avg_pct', 0)}%**",
-        f"🔥 最大量比：**{summary.get('max_vol_ratio', 0)}**",
-        "",
-        "🏆 **TOP5 精选**",
-    ]
-
-    for i, (_, row) in enumerate(top_stocks.iterrows(), 1):
-        code = row.get("代码", "-")
-        name = row.get("名称", "-")
-        chg = row.get("涨跌幅%", 0)
-        vol = row.get("量比", 0)
-        rush = row.get("抢筹", "-")
-
-        if chg > 5:
-            emoji = "🚀"
-        elif chg > 3:
-            emoji = "🔥"
-        else:
-            emoji = "📌"
-
-        rush_emoji = "⭐" if "真抢筹" in str(rush) else ""
-
-        msg_lines.append(f"{i}. {emoji} **{name}**（{code}）")
-        msg_lines.append(f"   涨幅：{chg:+.2f}% ｜ 量比：{vol:.2f}")
-        if rush_emoji:
-            msg_lines.append(f"   {rush_emoji} 抢筹：{rush}")
-        else:
-            msg_lines.append(f"   抢筹：{rush}")
-
-    msg_lines.append("")
-    msg_lines.append("⚠️ *以上内容仅供参考，不构成投资建议*")
-
-    msg = "\n".join(msg_lines)
-
-    # 发送消息
-    try:
-        send_url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
-        payload = {
-            "touser": touser,
-            "msgtype": "markdown",
-            "agentid": int(agentid),
-            "markdown": {
-                "content": msg,
-            }
-        }
-        resp = requests.post(send_url, json=payload, timeout=10)
-        data = resp.json()
-        if data.get("errcode") == 0:
-            return True
-        else:
-            st.warning(f"⚠️ 消息发送失败: {data.get('errmsg', '未知错误')}")
-            return False
-    except Exception as e:
-        st.warning(f"⚠️ 消息发送异常: {e}")
-        return False
+# ============================================================
+# 综合评分系统（满分100分）
+# ============================================================
+def calc_composite_score(vol_ratio: float, turnover: float, pct: float, close: float, ma20: float | None) -> int:
+    score = 0
+    if vol_ratio >= 2.5:
+        score += 30
+    elif vol_ratio >= 2.0:
+        score += 20
+    else:
+        score += 10
+    if 5 <= turnover <= 8:
+        score += 25
+    elif 3 <= turnover <= 10:
+        score += 15
+    if pct >= 4:
+        score += 25
+    elif pct >= 3:
+        score += 15
+    if ma20 is not None and ma20 > 0:
+        deviation = (close - ma20) / ma20 * 100
+        if deviation > 5:
+            score += 20
+        elif deviation > 3:
+            score += 10
+    return min(score, 100)
 
 # ============================================================
-# 选股逻辑
+# 主力阶段分析
+# ============================================================
+def analyze_main_force_stage(vol_ratio: float, pct: float, turnover: float, close: float, ma20: float | None) -> dict:
+    is_high_volume = vol_ratio >= 2.0
+    is_high_turnover = turnover >= 5
+    is_high_pct = pct >= 3
+    is_above_ma20 = ma20 is not None and close > ma20
+    deviation = ((close - ma20) / ma20 * 100) if ma20 and ma20 > 0 else 0
+
+    if is_high_volume and is_high_pct and is_above_ma20 and deviation > 5:
+        stage = "🚀 主升浪拉升"
+        detail = "放量上涨，股价远高于均线，主力拉升阶段"
+        confidence = "高"
+    elif is_high_volume and not is_high_pct and is_above_ma20:
+        stage = "📦 震荡洗盘"
+        detail = "放量但涨幅不大，主力在清洗浮筹"
+        confidence = "中"
+    elif is_high_volume and pct < 0:
+        stage = "📉 主力出货"
+        detail = "放量下跌，主力可能在高位派发筹码"
+        confidence = "高"
+    elif not is_high_volume and is_high_pct and deviation < 3:
+        stage = "📈 主力建仓"
+        detail = "温和放量上涨，主力在悄悄收集筹码"
+        confidence = "中"
+    elif vol_ratio < 1.5 and turnover < 3:
+        stage = "⏸️ 横盘整理"
+        detail = "缩量横盘，方向不明，等待突破"
+        confidence = "低"
+    else:
+        stage = "🔀 方向不明"
+        detail = "量价关系不明确，建议观望"
+        confidence = "低"
+
+    return {
+        "stage": stage,
+        "detail": detail,
+        "confidence": confidence,
+        "deviation": round(deviation, 2)
+    }
+
+# ============================================================
+# 走势预判
+# ============================================================
+def predict_trend(score: int, stage_info: dict, pct: float) -> dict:
+    confidence = stage_info.get("confidence", "低")
+
+    if score >= 80 and "拉升" in stage_info["stage"]:
+        trend = "📈 短期看涨"
+        suggestion = "✅ 强烈推荐关注"
+        reason = "综合评分高，主力处于拉升阶段"
+    elif score >= 70 and "建仓" in stage_info["stage"]:
+        trend = "📈 中期看涨"
+        suggestion = "✅ 建议关注"
+        reason = "主力在建仓，评分良好"
+    elif score >= 60 and "震荡" in stage_info["stage"]:
+        trend = "➡️ 震荡偏多"
+        suggestion = "⏳ 等待突破"
+        reason = "震荡洗盘阶段，等待放量突破"
+    elif score >= 70 and "出货" in stage_info["stage"]:
+        trend = "📉 短期看跌"
+        suggestion = "⚠️ 建议回避"
+        reason = "主力出货迹象，风险较高"
+    elif score < 60:
+        trend = "📉 短期看跌"
+        suggestion = "⚠️ 建议观望"
+        reason = "综合评分较低，暂不介入"
+    else:
+        trend = "➡️ 方向不明"
+        suggestion = "⏳ 建议观望"
+        reason = "技术指标不明确"
+
+    return {
+        "trend": trend,
+        "suggestion": suggestion,
+        "reason": reason,
+        "confidence": confidence
+    }
+
+# ============================================================
+# 计算建议购入价和止损价
+# ============================================================
+def calc_price_levels(close: float, ma20: float | None, pct: float) -> dict:
+    if ma20 is not None and ma20 > 0:
+        support = round(ma20, 2)
+        buy_price = round(ma20 * 1.01, 2)
+        stop_loss = round(ma20 * 0.97, 2)
+        target = round(close * 1.05, 2)
+    else:
+        support = round(close * 0.95, 2)
+        buy_price = round(close * 0.98, 2)
+        stop_loss = round(close * 0.92, 2)
+        target = round(close * 1.05, 2)
+
+    return {
+        "current": round(close, 2),
+        "buy_price": buy_price,
+        "stop_loss": stop_loss,
+        "target": target,
+        "support": support
+    }
+
+# ============================================================
+# 抢筹分析
 # ============================================================
 def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
-    """计算尾盘抢筹强度"""
     if df_1min is None or len(df_1min) < 10:
         return {"label": "数据不足", "score": 0, "detail": ""}
     try:
@@ -306,41 +337,125 @@ def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
     except Exception:
         return {"label": "异常", "score": 0, "detail": ""}
 
-def run_selection(enable_rush: bool = True, max_stocks: int = 30):
-    """执行完整选股流程"""
-    now = beijing_now()
-    # 交易日判断：非交易日直接返回
-    if not is_trading_day():
-        st.warning("⚠️ 今日非交易日（周一至周五为交易日），请于交易日运行时再试")
+# ============================================================
+# 企业微信推送
+# ============================================================
+def get_wecom_access_token(corpid: str, secret: str) -> str | None:
+    try:
+        url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={corpid}&corpsecret={secret}"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        if data.get("errcode") == 0:
+            return data.get("access_token")
+        else:
+            st.warning(f"⚠️ 获取 access_token 失败: {data.get('errmsg', '未知错误')}")
+            return None
+    except Exception as e:
+        st.warning(f"⚠️ 获取 access_token 异常: {e}")
         return None
-    # 判断是否为尾盘时段
+
+def send_wecom_message(df: pd.DataFrame, summary: dict) -> bool:
+    if df is None or df.empty:
+        return False
+    config = get_config()
+    wecom = config.get("wecom", {})
+    corpid = wecom.get("corpid", "")
+    agentid = wecom.get("agentid", "")
+    secret = wecom.get("secret", "")
+    touser = wecom.get("touser", "@all")
+
+    if not all([corpid, agentid, secret]):
+        st.warning("⚠️ 企业微信配置不完整")
+        return False
+
+    token = get_wecom_access_token(corpid, secret)
+    if token is None:
+        return False
+
+    now = beijing_now()
+    top_stocks = df.head(5)
+
+    msg_lines = [
+        f"📈 **尾盘智能选股结果**",
+        f"🕐 时间：{now.strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        f"📊 共筛选出 **{len(df)}** 只候选股",
+        f"📈 平均涨幅：**{summary.get('avg_pct', 0)}%**",
+        f"⭐ 最高评分：**{summary.get('max_score', 0)}分**",
+        "",
+        "🏆 **TOP5 精选**",
+    ]
+
+    for i, (_, row) in enumerate(top_stocks.iterrows(), 1):
+        code = row.get("代码", "-")
+        name = row.get("名称", "-")
+        chg = row.get("涨跌幅%", 0)
+        vol = row.get("量比", 0)
+        score = row.get("综合评分", 0)
+        stage = row.get("主力阶段", "-")
+
+        emoji = "🚀" if chg > 5 else ("🔥" if chg > 3 else "📌")
+
+        msg_lines.append(f"{i}. {emoji} **{name}**（{code}）")
+        msg_lines.append(f"   涨幅：{chg:+.2f}% ｜ 量比：{vol:.2f} ｜ 评分：{score}分")
+        msg_lines.append(f"   {stage}")
+
+    msg_lines.append("")
+    msg_lines.append("⚠️ *以上内容仅供参考，不构成投资建议*")
+
+    msg = "\n".join(msg_lines)
+
+    try:
+        send_url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
+        payload = {
+            "touser": touser,
+            "msgtype": "markdown",
+            "agentid": int(agentid),
+            "markdown": {"content": msg}
+        }
+        resp = requests.post(send_url, json=payload, timeout=10)
+        data = resp.json()
+        return data.get("errcode") == 0
+    except Exception:
+        return False
+
+# ============================================================
+# 主选股逻辑
+# ============================================================
+def run_selection(enable_rush: bool = True, max_stocks: int = 30):
+    now = beijing_now()
+
+    if not is_trading_day():
+        st.warning("⚠️ 今日非交易日，请于交易日运行时再试")
+        return None
+
     tail_time = is_tail_time()
-    # 非尾盘时段自动禁用抢筹分析
     if not tail_time:
         enable_rush = False
-    # 将实际状态写入 session_state
+        st.info("ℹ️ 当前非尾盘时段，抢筹分析已自动跳过")
+
     st.session_state["rush_actual_enabled"] = enable_rush
-    st.session_state["rush_auto_disabled"] = not tail_time
-    # 非尾盘提示（在进度条之前显示）
-    if not tail_time:
-        st.info("ℹ️ 当前非尾盘时段（14:30-15:00），抢筹分析已自动跳过。可查看历史数据或手动运行。")
-    # 进度条
+
     status_text = st.empty()
     progress = st.progress(0.0, text="正在初始化...")
     status_text.text("⏳ 准备获取实时行情...")
+
     df = fetch_realtime_quotes()
     if df is None:
-        st.error("❌ 无法获取实时行情，请检查网络或稍后重试（建议点击「清除缓存并刷新」）")
+        st.error("❌ 无法获取实时行情")
         return None
+
     config = get_config()
     total = len(df)
     results = []
     rush_cache = {}
     errors = 0
+
     for i, (idx, row) in enumerate(df.iterrows()):
         if i % 10 == 0:
             progress.progress((i + 1) / total, text=f"⏳ 正在分析 {i+1}/{total} ...")
-            status_text.text(f"📊 已筛选 {len(results)} 只候选股（已处理 {i+1}/{total}）")
+            status_text.text(f"📊 已筛选 {len(results)} 只候选股")
+
         try:
             symbol = str(row["代码"]).zfill(6)
             name = str(row["名称"])
@@ -349,7 +464,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             amount = float(row["成交额"])
             turnover = float(row["换手率"])
             close = float(row.get("最新价", 0))
-            # 筛选条件
+
             if not (config["pct_min"] < chg < config["pct_max"]):
                 continue
             if vol_ratio < config["vol_ratio_min"]:
@@ -358,13 +473,20 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
                 continue
             if amount < config["amount_min"]:
                 continue
-            # 抢筹分析（如果启用）
+
+            ma20 = fetch_ma20(symbol)
+            composite_score = calc_composite_score(vol_ratio, turnover, chg, close, ma20)
+            stage_info = analyze_main_force_stage(vol_ratio, chg, turnover, close, ma20)
+            price_levels = calc_price_levels(close, ma20, chg)
+            trend_info = predict_trend(composite_score, stage_info, chg)
+
             if enable_rush:
                 if symbol not in rush_cache:
                     rush_cache[symbol] = calc_intraday_rush(fetch_intraday_minute(symbol))
                 rush = rush_cache[symbol]
             else:
                 rush = {"label": "-", "score": 0, "detail": "-"}
+
             results.append({
                 "代码": symbol,
                 "名称": name,
@@ -373,44 +495,58 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
                 "换手率%": round(turnover, 2),
                 "成交额亿": round(amount / 1e8, 2),
                 "最新价": round(close, 2),
+                "MA20": round(ma20, 2) if ma20 else "-",
+                "综合评分": composite_score,
+                "主力阶段": stage_info["stage"],
+                "阶段详情": stage_info["detail"],
+                "信心度": stage_info["confidence"],
+                "走势预判": trend_info["trend"],
+                "操作建议": trend_info["suggestion"],
+                "建议理由": trend_info["reason"],
+                "建议购入价": price_levels["buy_price"],
+                "止损价": price_levels["stop_loss"],
+                "目标价": price_levels["target"],
+                "支撑位": price_levels["support"],
                 "抢筹": rush["label"],
                 "抢筹评分": rush["score"],
-                "_sort_key": vol_ratio,
+                "_sort_key": composite_score,
             })
         except Exception:
             errors += 1
             continue
+
     progress.progress(1.0, text="✅ 选股完成！")
     status_text.text(f"✅ 选股完成！共找到 {len(results)} 只候选股")
+
     if not results:
-        st.warning("⚠️ 未找到符合条件的股票，请调整筛选条件或稍后重试")
+        st.warning("⚠️ 未找到符合条件的股票")
         return None
-    # 按量比排序
+
     results.sort(key=lambda x: x["_sort_key"], reverse=True)
     df_result = pd.DataFrame(results[:max_stocks])
     df_result = df_result.drop(columns=["_sort_key"])
-    # 统计摘要
+
     summary = {
         "total_stocks": total,
         "passed": len(results),
         "displayed": min(len(results), max_stocks),
         "avg_pct": round(df_result["涨跌幅%"].mean(), 2),
         "max_vol_ratio": round(df_result["量比"].max(), 2),
+        "max_score": int(df_result["综合评分"].max()),
         "rush_distribution": df_result["抢筹"].value_counts().to_dict(),
         "errors": errors,
     }
     st.session_state["last_summary"] = summary
+    st.session_state["last_results"] = df_result
+    st.session_state["last_results_ts"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # ---- 企业微信推送 ----
     try:
         if df_result is not None and not df_result.empty:
             success = send_wecom_message(df_result, summary)
             if success:
                 st.toast("✅ 已推送到企业微信", icon="📱")
-            else:
-                st.toast("⚠️ 推送失败，请检查企业微信配置", icon="⚠️")
-    except Exception as e:
-        st.warning(f"⚠️ 推送异常: {e}")
+    except Exception:
+        pass
 
     return df_result
 
@@ -418,7 +554,6 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
 # 结果存储
 # ============================================================
 def save_daily_results(df: pd.DataFrame):
-    """保存当日选股结果（含空数据检查和30天清理）"""
     if df is None or df.empty:
         return
     today = today_str()
@@ -428,7 +563,6 @@ def save_daily_results(df: pd.DataFrame):
         "data": df.to_dict(orient="records"),
         "timestamp": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    # 30天清理机制
     if len(st.session_state["history_results"]) > 30:
         sorted_dates = sorted(st.session_state["history_results"].keys())
         for old_date in sorted_dates[:-30]:
@@ -437,7 +571,6 @@ def save_daily_results(df: pd.DataFrame):
     st.session_state["last_results_ts"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
 
 def load_daily_results(date_str: str) -> pd.DataFrame | None:
-    """加载指定日期的选股结果"""
     history = st.session_state.get("history_results", {})
     record = history.get(date_str)
     if record is None:
@@ -445,16 +578,14 @@ def load_daily_results(date_str: str) -> pd.DataFrame | None:
     return pd.DataFrame(record["data"])
 
 def load_last_results() -> tuple[pd.DataFrame | None, str | None]:
-    """加载最近一次选股结果"""
     df = st.session_state.get("last_results")
     ts = st.session_state.get("last_results_ts")
     return df, ts
 
 # ============================================================
-# 页面渲染函数
+# 渲染函数
 # ============================================================
 def render_summary_panel():
-    """渲染统计摘要面板"""
     summary = st.session_state.get("last_summary")
     if summary is None:
         return
@@ -464,9 +595,9 @@ def render_summary_panel():
     cols[1].metric("通过筛选", f"{summary['passed']} 只")
     cols[2].metric("展示数量", f"{summary['displayed']} 只")
     cols[3].metric("平均涨幅", f"{summary['avg_pct']}%")
-    cols[4].metric("最大量比", summary["max_vol_ratio"])
+    cols[4].metric("最高评分", summary["max_score"])
     cols[5].metric("数据异常", summary["errors"])
-    # A50 整合到摘要面板
+
     a50_change = fetch_a50_change()
     rush_str = ""
     if summary.get("rush_distribution"):
@@ -482,145 +613,262 @@ def render_summary_panel():
     st.divider()
 
 def render_yesterday_review():
-    """渲染昨日回顾面板"""
     today = today_str()
     yesterday = (beijing_now() - timedelta(days=1)).strftime("%Y-%m-%d")
     df_today = load_daily_results(today)
     df_yesterday = load_daily_results(yesterday)
+
     if df_today is None and df_yesterday is None:
-        st.caption("📅 暂无历史数据，运行选股后自动记录")
+        st.caption("📅 暂无历史数据")
         return
+
     st.subheader("📅 历史对比")
     col1, col2 = st.columns(2)
+
     with col1:
         st.caption(f"📌 今日 ({today})")
         if df_today is not None and not df_today.empty:
-            st.dataframe(df_today[["代码", "名称", "涨跌幅%", "量比", "抢筹"]],
+            st.dataframe(df_today[["代码", "名称", "涨跌幅%", "量比", "综合评分", "主力阶段"]],
                         use_container_width=True, hide_index=True)
         else:
             st.text("今日暂无数据")
+
     with col2:
         st.caption(f"📌 昨日 ({yesterday})")
         if df_yesterday is not None and not df_yesterday.empty:
-            st.dataframe(df_yesterday[["代码", "名称", "涨跌幅%", "量比", "抢筹"]],
+            st.dataframe(df_yesterday[["代码", "名称", "涨跌幅%", "量比", "综合评分", "主力阶段"]],
                         use_container_width=True, hide_index=True)
         else:
             st.text("昨日暂无数据")
-    # 连续上榜分析
+
     if df_today is not None and df_yesterday is not None:
         today_codes = set(df_today["代码"].astype(str))
         yesterday_codes = set(df_yesterday["代码"].astype(str))
         overlap = today_codes & yesterday_codes
         if overlap:
             overlap_df = df_today[df_today["代码"].astype(str).isin(overlap)].copy()
-            if "抢筹" in overlap_df.columns:
-                overlap_df["抢筹"] = overlap_df["抢筹"].apply(
-                    lambda x: f"⭐ {x}" if not str(x).startswith("⭐") else x
-                )
             st.success(f"⭐ 连续上榜：{len(overlap)} 只股票")
-            st.dataframe(overlap_df[["代码", "名称", "涨跌幅%", "量比", "抢筹"]],
+            st.dataframe(overlap_df[["代码", "名称", "涨跌幅%", "综合评分", "主力阶段"]],
                         use_container_width=True, hide_index=True)
         else:
-            st.info("📊 今日与昨日无重叠股票，市场风格可能切换")
+            st.info("📊 今日与昨日无重叠股票")
 
 # ============================================================
-# Streamlit 主页面
+# 股票详情页
 # ============================================================
-st.set_page_config(
-    page_title="尾盘智能选股",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-st.title("📈 尾盘智能选股工具")
-st.caption("基于 akshare 实时数据 + 尾盘抢筹分析（A股专用）")
+def render_stock_detail(symbol: str):
+    df_result, _ = load_last_results()
+    if df_result is None or df_result.empty:
+        st.warning("暂无数据，请先运行选股")
+        return
 
-# ---- 侧边栏 ----
-with st.sidebar:
-    st.header("⚙️ 参数设置")
-    now = beijing_now()
-    tail_time = is_tail_time()
-    trading_day = is_trading_day()
-    # 时段提示
-    if tail_time and trading_day:
-        st.success("✅ 已进入尾盘时段（14:30-15:00），可启用抢筹分析")
-    elif trading_day:
-        st.info("ℹ️ 当前为交易时段，但非尾盘时间（尾盘分析将在14:30后可用）")
+    stock_row = df_result[df_result["代码"].astype(str) == str(symbol)]
+    if stock_row.empty:
+        st.warning(f"未找到股票 {symbol}")
+        return
+
+    row = stock_row.iloc[0]
+
+    st.subheader(f"📊 {row['名称']}（{row['代码']}）详细分析")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("最新价", f"{row['最新价']} 元", delta=f"{row['涨跌幅%']:+.2f}%")
+    col2.metric("综合评分", f"{row['综合评分']} 分", delta="满分100分")
+    col3.metric("主力阶段", row.get("主力阶段", "-"))
+
+    st.subheader("💰 价格参考")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("建议购入价", f"{row.get('建议购入价', '-')} 元")
+    col2.metric("止损价", f"{row.get('止损价', '-')} 元", delta="风险控制")
+    col3.metric("目标价", f"{row.get('目标价', '-')} 元")
+    col4.metric("支撑位", f"{row.get('支撑位', '-')} 元")
+
+    st.subheader("🔮 走势预判")
+    trend = row.get("走势预判", "-")
+    suggestion = row.get("操作建议", "-")
+    reason = row.get("建议理由", "-")
+
+    if "看涨" in trend or "推荐" in suggestion:
+        st.success(f"**{trend}** | **{suggestion}**")
+    elif "看跌" in trend or "回避" in suggestion or "观望" in suggestion:
+        st.warning(f"**{trend}** | **{suggestion}**")
     else:
-        st.warning("⚠️ 今日非交易日，展示历史数据或手动运行")
-    # 抢筹分析开关（非尾盘时段禁用）
-    enable_rush = st.checkbox(
-        "🔍 启用尾盘抢筹分析",
-        value=tail_time and trading_day,
-        disabled=not (tail_time and trading_day),
-        help="仅在尾盘时段（14:30-15:00）可用" if not (tail_time and trading_day) else "分析尾盘抢筹强度"
+        st.info(f"**{trend}** | **{suggestion}**")
+    st.caption(f"📝 {reason}")
+
+    st.subheader("📈 主力阶段分析")
+    st.info(f"**{row.get('主力阶段', '-')}**")
+    st.caption(f"📝 {row.get('阶段详情', '-')}")
+    st.caption(f"信心度：{row.get('信心度', '-')}")
+
+    st.subheader("📊 技术指标")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("量比", row.get("量比", "-"))
+    col2.metric("换手率", f"{row.get('换手率%', '-')}%")
+    col3.metric("MA20", row.get("MA20", "-"))
+    col4.metric("抢筹评分", row.get("抢筹评分", "-"))
+
+    if "真抢筹" in str(row.get("抢筹", "")):
+        st.success(f"⭐ 抢筹状态：{row.get('抢筹', '-')}")
+    else:
+        st.caption(f"抢筹状态：{row.get('抢筹', '-')}")
+
+    if st.button("← 返回列表"):
+        st.session_state["selected_stock"] = None
+        st.rerun()
+
+# ============================================================
+# 主页面
+# ============================================================
+def main_page():
+    st.set_page_config(
+        page_title="尾盘智能选股",
+        page_icon="📈",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
-    if not (tail_time and trading_day):
-        st.caption("ℹ️ 抢筹分析已禁用（非尾盘时段）")
-    else:
-        if enable_rush:
-            st.caption("✅ 抢筹分析：已启用")
+
+    st.title("📈 尾盘智能选股工具")
+    st.caption("基于 akshare 实时数据 + 综合评分系统 + 主力分析")
+
+    with st.sidebar:
+        st.header("⚙️ 参数设置")
+        now = beijing_now()
+        tail_time = is_tail_time()
+        trading_day = is_trading_day()
+
+        if tail_time and trading_day:
+            st.success("✅ 已进入尾盘时段（14:30-15:00）")
+        elif trading_day:
+            st.info("ℹ️ 交易时段，尾盘分析将在14:30后可用")
         else:
-            st.caption("ℹ️ 抢筹分析：已禁用")
-    max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 30, 5)
+            st.warning("⚠️ 今日非交易日")
 
-    st.divider()
-    # ---- 企业微信状态 ----
-    wecom = get_config().get("wecom", {})
-    if wecom.get("corpid") and wecom.get("agentid") and wecom.get("secret"):
-        st.caption("📱 企业微信推送：已启用 ✅")
+        enable_rush = st.checkbox(
+            "🔍 启用尾盘抢筹分析",
+            value=tail_time and trading_day,
+            disabled=not (tail_time and trading_day),
+        )
+        if not (tail_time and trading_day):
+            st.caption("ℹ️ 抢筹分析已禁用（非尾盘时段）")
+
+        max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 30, 5)
+
+        st.divider()
+        wecom = get_config().get("wecom", {})
+        if wecom.get("corpid") and wecom.get("agentid") and wecom.get("secret"):
+            st.caption("📱 企业微信推送：已启用 ✅")
+        else:
+            st.caption("📱 企业微信推送：未配置 ⚠️")
+
+        st.divider()
+        if st.button("🔄 运行选股", use_container_width=True, type="primary"):
+            with st.spinner("正在运行选股逻辑..."):
+                df = run_selection(enable_rush, max_stocks)
+                if df is not None:
+                    save_daily_results(df)
+                    st.success(f"✅ 选股完成，共 {len(df)} 只候选股")
+                    st.rerun()
+
+        if st.button("🗑️ 清除缓存并刷新", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state["last_summary"] = None
+            st.rerun()
+
+        if st.button("🗑️ 清空历史数据", use_container_width=True):
+            for key in ["history_results", "last_results", "last_results_ts", "last_summary", "selected_stock"]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.success("✅ 历史数据已清空")
+            st.rerun()
+
+        st.divider()
+        st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
+        st.caption("数据来源：akshare")
+
+    if st.session_state.get("selected_stock") is not None:
+        render_stock_detail(st.session_state["selected_stock"])
+        return
+
+    render_summary_panel()
+
+    df_result, cached_ts = load_last_results()
+
+    if df_result is not None and not df_result.empty:
+        st.subheader(f"📊 候选股票列表（共 {len(df_result)} 只）")
+        if cached_ts:
+            st.caption(f"⏱️ 缓存时间戳：{cached_ts}")
+
+        display_cols = ["代码", "名称", "最新价", "涨跌幅%", "量比", "换手率%", "综合评分", "主力阶段", "操作建议"]
+
+        st.dataframe(
+            df_result[display_cols],
+            column_config={
+                "代码": st.column_config.TextColumn("代码", width="small"),
+                "名称": st.column_config.TextColumn("名称", width="medium"),
+                "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
+                "涨跌幅%": st.column_config.NumberColumn("涨跌幅%", format="%.2f%%"),
+                "量比": st.column_config.NumberColumn("量比", format="%.2f"),
+                "换手率%": st.column_config.NumberColumn("换手率%", format="%.2f%%"),
+                "综合评分": st.column_config.NumberColumn("综合评分", format="%d"),
+                "主力阶段": st.column_config.TextColumn("主力阶段", width="medium"),
+                "操作建议": st.column_config.TextColumn("操作建议", width="medium"),
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.subheader("⭐ 高分推荐（评分 ≥ 70）")
+        high_score_df = df_result[df_result["综合评分"] >= 70]
+        if not high_score_df.empty:
+            st.dataframe(
+                high_score_df[display_cols],
+                column_config={
+                    "代码": st.column_config.TextColumn("代码", width="small"),
+                    "名称": st.column_config.TextColumn("名称", width="medium"),
+                    "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
+                    "涨跌幅%": st.column_config.NumberColumn("涨跌幅%", format="%.2f%%"),
+                    "量比": st.column_config.NumberColumn("量比", format="%.2f"),
+                    "换手率%": st.column_config.NumberColumn("换手率%", format="%.2f%%"),
+                    "综合评分": st.column_config.NumberColumn("综合评分", format="%d"),
+                    "主力阶段": st.column_config.TextColumn("主力阶段", width="medium"),
+                    "操作建议": st.column_config.TextColumn("操作建议", width="medium"),
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption("💡 评分 ≥ 70 分的股票已用绿色背景高亮（在网页显示中）")
+        else:
+            st.info("ℹ️ 暂无评分 ≥ 70 的股票")
+
+        st.subheader("🔍 点击查看详情")
+        selected_code = st.selectbox(
+            "选择股票查看详细分析",
+            options=df_result["代码"].astype(str).tolist(),
+            format_func=lambda x: f"{x} - {df_result[df_result['代码'].astype(str)==x]['名称'].iloc[0]}"
+        )
+        if st.button("📊 查看详情", use_container_width=True):
+            st.session_state["selected_stock"] = selected_code
+            st.rerun()
+
+        csv_data = df_result.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            label="📥 导出 CSV",
+            data=csv_data,
+            file_name=f"尾盘选股_{now.strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+        )
     else:
-        st.caption("📱 企业微信推送：未配置 ⚠️")
+        st.info("💡 暂无选股结果，请点击侧边栏「运行选股」按钮")
 
     st.divider()
-    # 运行按钮
-    if st.button("🔄 运行选股", use_container_width=True, type="primary"):
-        with st.spinner("正在运行选股逻辑..."):
-            df = run_selection(enable_rush, max_stocks)
-            if df is not None:
-                save_daily_results(df)
-                st.success(f"✅ 选股完成，共 {len(df)} 只候选股")
-                st.rerun()
-    if st.button("🗑️ 清除缓存并刷新", use_container_width=True):
-        st.cache_data.clear()
-        st.session_state["last_summary"] = None
-        st.rerun()
-    if st.button("🗑️ 清空历史数据", use_container_width=True):
-        for key in ["history_results", "last_results", "last_results_ts", "last_summary", "rush_auto_disabled"]:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.success("✅ 历史数据已清空")
-        st.rerun()
+    render_yesterday_review()
     st.divider()
-    st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
-    st.caption("数据来源：akshare")
+    st.caption(f"🔄 数据更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）")
+    st.caption("⚠️ 以上内容仅供参考，不构成投资建议。股市有风险，投资需谨慎。")
 
-# ---- 主页面 ----
-# 渲染统计摘要（含A50）
-render_summary_panel()
-# 加载并显示最近结果
-df_result, cached_ts = load_last_results()
-if df_result is not None and not df_result.empty:
-    st.subheader(f"📊 候选股票列表（共 {len(df_result)} 只）")
-    if cached_ts:
-        st.caption(f"⏱️ 缓存时间戳：{cached_ts}")
-    st.dataframe(
-        df_result,
-        use_container_width=True,
-        hide_index=True,
-    )
-    # 导出CSV
-    csv_data = df_result.to_csv(index=False, encoding="utf-8-sig")
-    st.download_button(
-        label="📥 导出 CSV",
-        data=csv_data,
-        file_name=f"尾盘选股_{now.strftime('%Y%m%d_%H%M')}.csv",
-        mime="text/csv",
-    )
-else:
-    st.info("💡 暂无选股结果，请点击侧边栏「运行选股」按钮")
-st.divider()
-render_yesterday_review()
-st.divider()
-st.caption(f"🔄 数据更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）")
-st.caption("⚠️ 以上内容仅供参考，不构成投资建议。股市有风险，投资需谨慎。")
+# ============================================================
+# 程序入口
+# ============================================================
+if __name__ == "__main__":
+    main_page()
