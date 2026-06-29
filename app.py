@@ -334,9 +334,19 @@ def render_summary_panel():
     cols[3].metric("平均涨幅", f"{summary['avg_pct']}%")
     cols[4].metric("最大量比", summary["max_vol_ratio"])
     cols[5].metric("数据异常", summary["errors"])
+    # A50 整合到摘要面板
+    a50_change = fetch_a50_change()
+    rush_str = ""
     if summary.get("rush_distribution"):
         rush_str = " | ".join([f"{k}:{v}" for k, v in summary["rush_distribution"].items()])
-        st.caption(f"🏷️ 抢筹分布：{rush_str}")
+    info_parts = []
+    if a50_change is not None:
+        sign = "+" if a50_change >= 0 else ""
+        info_parts.append(f"富时A50：{sign}{a50_change:.2f}%")
+    if rush_str:
+        info_parts.append(f"抢筹分布：{rush_str}")
+    if info_parts:
+        st.caption("🏷️ " + "　|　".join(info_parts))
     st.divider()
 
 def render_yesterday_review():
@@ -381,18 +391,6 @@ def render_yesterday_review():
         else:
             st.info("📊 今日与昨日无重叠股票，市场风格可能切换")
 
-def render_a50_panel():
-    """渲染A50涨跌面板"""
-    a50_change = fetch_a50_change()
-    if a50_change is None:
-        st.caption("⚠️ 无法获取A50数据")
-        return
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if a50_change > 0:
-            st.metric("富时A50", f"+{a50_change:.2f}%")
-        else:
-            st.metric("富时A50", f"{a50_change:.2f}%")
 
 # ============================================================
 # Streamlit 主页面
@@ -429,9 +427,7 @@ with st.sidebar:
     if not (tail_time and trading_day):
         st.caption("ℹ️ 抢筹分析已禁用（非尾盘时段）")
     else:
-        # 显示抢筹实际状态
-        rush_actual = st.session_state.get("rush_actual_enabled", enable_rush)
-        if rush_actual:
+        if enable_rush:
             st.caption("✅ 抢筹分析：已启用")
         else:
             st.caption("ℹ️ 抢筹分析：已禁用")
@@ -460,9 +456,7 @@ with st.sidebar:
     st.caption("数据来源：akshare")
 
 # ---- 主页面 ----
-# 渲染A50面板
-render_a50_panel()
-# 渲染统计摘要
+# 渲染统计摘要（含A50）
 render_summary_panel()
 # 加载并显示最近结果
 df_result, cached_ts = load_last_results()
