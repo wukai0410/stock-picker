@@ -8,8 +8,6 @@ import pandas as pd
 import numpy as np
 import akshare as ak
 from datetime import datetime, time
-import json
-import os
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -27,10 +25,16 @@ st.set_page_config(
 # ============================================================
 # 全局常量
 # ============================================================
-CACHE_FILE = "last_picks.json"
-CACHE_TTL_SECONDS = 300  # 5 分钟
 TAIL_SESSION_START = time(14, 30)  # 尾盘开始时间
 DISPLAY_START = time(14, 50)       # 刷新展示时间
+
+
+def get_cache_ttl() -> int:
+    """尾盘时段 TTL=600s，非尾盘 TTL=3600s"""
+    now = datetime.now().time()
+    if TAIL_SESSION_START <= now <= time(15, 0):
+        return 600
+    return 3600
 
 # ============================================================
 # 样式注入
@@ -70,7 +74,7 @@ def inject_css():
 # ============================================================
 # 缓存数据获取
 # ============================================================
-@st.cache_data(ttl=CACHE_TTL_SECONDS)
+@st.cache_data(ttl=get_cache_ttl())
 def fetch_realtime_quotes():
     """获取全 A 股实时行情"""
     try:
@@ -81,7 +85,7 @@ def fetch_realtime_quotes():
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS)
+@st.cache_data(ttl=get_cache_ttl())
 def fetch_historical_kline(symbol: str, period: int = 30):
     """获取单只股票近 N 日历史收盘价，返回 MA20"""
     try:
@@ -102,11 +106,20 @@ def fetch_historical_kline(symbol: str, period: int = 30):
 
 @st.cache_data(ttl=60)
 def fetch_intraday_minute(symbol: str):
-    """获取当日分时数据（1分钟线）"""
+    """获取当日分时数据（1分钟线），兼容「收盘」和「close」列名"""
     try:
         df = ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")
         if df.empty:
             return None
+        # 统一列名：如果有 "close" 列，重命名为 "收盘"
+        rename_map = {}
+        for c in df.columns:
+            if c.lower() == "close":
+                rename_map[c] = "收盘"
+            elif "时间" in c and c != "时间":
+                rename_map[c] = "时间"
+        if rename_map:
+            df = df.rename(columns=rename_map)
         return df
     except Exception:
         return None
@@ -132,7 +145,7 @@ def basic_filter(df: pd.DataFrame) -> pd.DataFrame:
     col_map = _detect_columns(df)
 
     # 1. 名称含 ST / *ST
-    mask_st = ~df[col_map["name"]].str.contains(r"\*?ST", na=False, regex=True)
+    mask_st = ~df[col_map["name"]].str.contains(r"\*?ST", na=False, regex=False)
 
     # 2. 成交量为 0（停牌）
     mask_vol = df[col_map["volume"]] > 0
@@ -343,11 +356,12 @@ def calc_intraday_rush(symbol: str, close: float) -> dict:
 def calc_pressure_test(close: float, slope_factor: float) -> dict:
     """
     量化测压模块
-    返回: {"premium": float, "pl_ratio": float}
+    返回: {"premium": float, "pl_ratio": float, "a50_pct": float}
     """
+    # 获取 A50 夜盘涨跌幅
+    a50_night = _fetch_a50_night_change()
+
     # 预期开盘溢价 = 尾盘动能因子 × 0.6 + A50 夜盘 × 0.4
-    # A50 夜盘暂用 0 代替（需要额外数据源）
-    a50_night = 0.0
     premium = (slope_factor * 0.6) + (a50_night * 0.4)
 
     # 盈亏比 = (压力位 - 收盘价) / (收盘价 - 支撑位)
@@ -358,10 +372,37 @@ def calc_pressure_test(close: float, slope_factor: float) -> dict:
     else:
         pl_ratio = (resistance - close) / (close - support)
 
-    return {"premium": round(premium, 2), "pl_ratio": round(pl_ratio, 2)}
+    return {"premium": round(premium, 2), "pl_ratio": round(pl_ratio, 2), "a50_pct": round(a50_night, 2)}
 
 
-def run_selection(pct_min: float, pct_max: float, turnover_min: float, turnover_max: float) -> pd.DataFrame:
+@st.cache_data(ttl=300)
+def _fetch_a50_night_change() -> float:
+    """获取富时 A50 指数期货当日涨跌幅"""
+    try:
+        df = ak.futures_zh_minute_sina(symbol="A50")
+        if df.empty or len(df) < 2:
+            return 0.0
+        # 取最新价和昨收（或前一日收盘）计算涨跌幅
+        col_close = None
+        for c in df.columns:
+            if "收盘" in c or "close" in c.lower() or "price" in c.lower():
+                col_close = c
+                break
+        if col_close is None and len(df.columns) > 0:
+            col_close = df.columns[-1]  # 兜底用最后一列
+        if col_close:
+            prices = pd.to_numeric(df[col_close], errors="coerce").dropna()
+            if len(prices) >= 2:
+                latest = prices.iloc[-1]
+                prev = prices.iloc[-2]
+                if prev != 0:
+                    return (latest - prev) / prev * 100
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def run_selection(pct_min: float, pct_max: float, turnover_min: float, turnover_max: float, enable_rush: bool = False) -> pd.DataFrame:
     """执行完整选股流程"""
     # Step 1: 获取实时行情
     with st.spinner("正在获取全 A 股实时行情..."):
@@ -420,9 +461,12 @@ def run_selection(pct_min: float, pct_max: float, turnover_min: float, turnover_
         score_ma = calc_ma20_score(close, ma20)
         total_score = score_vr + score_to + score_pct + score_ma
 
-        # 分时抢筹
-        rush = calc_intraday_rush(code, close)
-        total_score += rush["score_delta"]
+        # 分时抢筹（仅在开关开启时执行）
+        if enable_rush:
+            rush = calc_intraday_rush(code, close)
+            total_score += rush["score_delta"]
+        else:
+            rush = {"label": "未开启", "score_delta": 0, "slope_factor": 0.0}
 
         # 量化测压
         pressure = calc_pressure_test(close, rush["slope_factor"])
@@ -463,26 +507,23 @@ def run_selection(pct_min: float, pct_max: float, turnover_min: float, turnover_
 
 
 # ============================================================
-# 缓存读写
+# 结果缓存（st.session_state）
 # ============================================================
 def save_results(df: pd.DataFrame):
-    """保存选股结果到本地 JSON"""
-    try:
-        data = df.to_dict(orient="records")
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"timestamp": datetime.now().isoformat(), "data": data}, f, ensure_ascii=False)
-    except Exception:
-        pass
+    """保存选股结果到 session_state"""
+    st.session_state["cached_picks"] = {
+        "timestamp": datetime.now().isoformat(),
+        "data": df.to_dict(orient="records"),
+    }
 
 
 def load_results() -> pd.DataFrame | None:
-    """加载上次保存的结果"""
-    if not os.path.exists(CACHE_FILE):
+    """从 session_state 加载上次保存的结果"""
+    cached = st.session_state.get("cached_picks")
+    if cached is None:
         return None
     try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        return pd.DataFrame(obj["data"])
+        return pd.DataFrame(cached["data"])
     except Exception:
         return None
 
@@ -515,7 +556,8 @@ def main():
         )
 
         st.divider()
-        st.caption(f"数据缓存: {CACHE_TTL_SECONDS // 60} 分钟")
+        enable_rush_detection = st.checkbox("开启抢筹识别（耗时较长）", value=False)
+        st.caption(f"数据缓存: 尾盘10分钟 / 非尾盘1小时")
         st.caption(f"尾盘时段: {TAIL_SESSION_START.strftime('%H:%M')} - 15:00")
 
         if st.button("🔄 手动刷新数据", use_container_width=True):
@@ -542,7 +584,7 @@ def main():
             return
     else:
         # 尾盘时段：自动运行选股
-        df_result = run_selection(pct_min, pct_max, turnover_min, turnover_max)
+        df_result = run_selection(pct_min, pct_max, turnover_min, turnover_max, enable_rush_detection)
         if not df_result.empty:
             save_results(df_result)
 
