@@ -21,11 +21,13 @@ def today_str() -> str:
     return beijing_now().strftime("%Y-%m-%d")
 
 def is_tail_time() -> bool:
-    """判断当前是否处于尾盘时段（14:30-15:00，A股收盘前30分钟）"""
+    """判断当前是否处于尾盘时段（14:30:00 <= time <= 15:00:00）"""
     now = beijing_now()
-    # A股交易时间：9:30-11:30, 13:00-15:00
-    # 尾盘抢筹分析应在14:30-15:00进行
-    return (now.hour == 14 and now.minute >= 30) or (now.hour == 15 and now.minute == 0)
+    # 构造今天14:30和15:00的时间戳
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    tail_start = today.replace(hour=14, minute=30, second=0)
+    tail_end = today.replace(hour=15, minute=0, second=0)
+    return tail_start <= now <= tail_end
 
 def is_trading_day() -> bool:
     """判断今天是否为交易日（简单判断：周一至周五且非法定节假日）"""
@@ -134,81 +136,41 @@ def fetch_daily_kline(symbol: str, days: int = 30):
 
 @st.cache_data(ttl=60)
 def fetch_intraday_minute(symbol: str):
-    """获取当日1分钟分时数据（降级容错）"""
-    methods = [
-        ("stock_zh_a_hist_min_em", lambda: ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")),
-        ("stock_zh_a_spot_min_em", lambda: ak.stock_zh_a_spot_min_em(symbol=symbol, period="1")),
-    ]
-    for name, func in methods:
-        try:
-            df = func()
-            if df is None or df.empty:
-                continue
-            vol_col = _get_column(df, ["成交量", "volume", "vol", "VOL"])
-            close_col = _get_column(df, ["收盘", "close", "price", "最新价"])
-            if vol_col is None or close_col is None:
-                continue
-            df = df.rename(columns={vol_col: "volume", close_col: "close"})
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-            df["close"] = pd.to_numeric(df["close"], errors="coerce")
-            return df.dropna(subset=["volume", "close"])
-        except Exception:
-            continue
-    return None
+    """获取当日1分钟分时数据（仅保留已知可用接口）"""
+    try:
+        df = ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")
+        if df is None or df.empty:
+            return None
+        vol_col = _get_column(df, ["成交量", "volume", "vol", "VOL"])
+        close_col = _get_column(df, ["收盘", "close", "price", "最新价"])
+        if vol_col is None or close_col is None:
+            return None
+        df = df.rename(columns={vol_col: "volume", close_col: "close"})
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        return df.dropna(subset=["volume", "close"])
+    except Exception:
+        return None
 
 @st.cache_data(ttl=300)
 def fetch_a50_change() -> float:
-    """获取富时A50涨跌幅（降级容错）"""
-    methods = [
-        ("stock_fta50_hist_sina", lambda: _fetch_a50_sina()),
-        ("futures_zh_minute_sina", lambda: _fetch_a50_futures()),
-    ]
-    for name, func in methods:
-        try:
-            result = func()
-            if result is not None:
-                return result
-        except Exception:
-            continue
-    return 0.0
-
-def _fetch_a50_sina() -> float | None:
-    """从新浪获取A50数据"""
-    try:
-        df = ak.stock_fta50_hist_sina(symbol="a50")
-        if df is None or df.empty or len(df) < 2:
-            return None
-        price_col = _get_column(df, ["收盘", "close", "最新价", "price"])
-        if price_col is None:
-            return None
-        prices = pd.to_numeric(df[price_col], errors="coerce").dropna()
-        if len(prices) < 2:
-            return None
-        latest, prev = prices.iloc[-1], prices.iloc[-2]
-        if prev == 0:
-            return 0.0
-        return round((latest - prev) / prev * 100, 2)
-    except Exception:
-        return None
-
-def _fetch_a50_futures() -> float | None:
-    """从期货接口获取A50数据"""
+    """获取富时A50涨跌幅（仅保留期货接口）"""
     try:
         df = ak.futures_zh_minute_sina(symbol="A50")
         if df is None or df.empty or len(df) < 2:
-            return None
+            return 0.0
         price_col = _get_column(df, ["收盘价", "close", "price"])
         if price_col is None:
-            return None
+            return 0.0
         prices = pd.to_numeric(df[price_col], errors="coerce").dropna()
         if len(prices) < 2:
-            return None
+            return 0.0
         latest, prev = prices.iloc[-1], prices.iloc[-2]
         if prev == 0:
             return 0.0
         return round((latest - prev) / prev * 100, 2)
     except Exception:
-        return None
+        return 0.0
 
 # ============================================================
 # 选股逻辑
@@ -254,8 +216,12 @@ def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
 
 def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     """执行完整选股流程"""
-    # 判断是否为尾盘时段
     now = beijing_now()
+    # 交易日判断：非交易日直接返回
+    if not is_trading_day():
+        st.warning("⚠️ 今日非交易日（周一至周五为交易日），请于交易日运行时再试")
+        return None
+    # 判断是否为尾盘时段
     tail_time = is_tail_time()
     # 非尾盘时段自动禁用抢筹分析
     if not tail_time:
@@ -438,7 +404,7 @@ def render_yesterday_review():
             st.info("📊 今日与昨日无重叠股票，市场风格可能切换")
 
 def render_a50_panel():
-    """渲染A50夜盘涨跌面板"""
+    """渲染A50涨跌面板"""
     a50_change = fetch_a50_change()
     if a50_change is None:
         st.caption("⚠️ 无法获取A50数据")
@@ -446,9 +412,9 @@ def render_a50_panel():
     col1, col2 = st.columns([1, 3])
     with col1:
         if a50_change > 0:
-            st.metric("富时A50", f"+{a50_change:.2f}%", delta=f"{a50_change:.2f}%")
+            st.metric("富时A50", f"+{a50_change:.2f}%")
         else:
-            st.metric("富时A50", f"{a50_change:.2f}%", delta=f"{a50_change:.2f}%")
+            st.metric("富时A50", f"{a50_change:.2f}%")
 
 # ============================================================
 # Streamlit 主页面
