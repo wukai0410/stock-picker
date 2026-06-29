@@ -83,7 +83,7 @@ def inject_css():
 # ============================================================
 # 缓存数据获取
 # ============================================================
-@st.cache_data(ttl=get_cache_ttl())
+@st.cache_data(ttl=600)
 def fetch_realtime_quotes():
     """获取全 A 股实时行情"""
     try:
@@ -94,12 +94,10 @@ def fetch_realtime_quotes():
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=get_cache_ttl())
+@st.cache_data(ttl=600)
 def fetch_historical_kline(symbol: str, period: int = 30):
     """获取单只股票近 N 日历史收盘价，返回 MA20"""
     try:
-        # symbol 格式: "000001" → 需要补全为 "sz000001" 或 "sh000001"
-        code = _format_code(symbol)
         df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=(beijing_now() - pd.Timedelta(days=60)).strftime("%Y%m%d"), end_date=beijing_now().strftime("%Y%m%d"), adjust="qfq")
         if df.empty or "收盘" not in df.columns:
             return None
@@ -348,8 +346,8 @@ def calc_intraday_rush(symbol: str, close: float) -> dict:
 
     last5_ratio = last5_change / total_change if total_change != 0 else 0
 
-    # 斜率因子（用于量化测压）
-    slope_factor = slope_normalized
+    # 斜率因子（用于量化测压）— 尾盘有涨幅时才保留正斜率
+    slope_factor = slope_normalized if slope_normalized > 0 else 0.0
 
     # 判断抢筹 vs 诱多
     # 斜率平缓 (slope_normalized < 0.05 可视为 45 度推升) 且 最后5分钟占比 < 60%
@@ -394,11 +392,11 @@ def _fetch_a50_night_change() -> float:
         # 取最新价和昨收（或前一日收盘）计算涨跌幅
         col_close = None
         for c in df.columns:
-            if "收盘" in c or "close" in c.lower() or "price" in c.lower():
+            if "收盘" in c or "最新" in c or "close" in c.lower() or "price" in c.lower():
                 col_close = c
                 break
-        if col_close is None and len(df.columns) > 0:
-            col_close = df.columns[-1]  # 兜底用最后一列
+        if col_close is None:
+            return 0.0
         if col_close:
             prices = pd.to_numeric(df[col_close], errors="coerce").dropna()
             if len(prices) >= 2:
@@ -478,7 +476,10 @@ def run_selection(pct_min: float, pct_max: float, turnover_min: float, turnover_
             rush = {"label": "未开启", "score_delta": 0, "slope_factor": 0.0}
 
         # 量化测压
-        pressure = calc_pressure_test(close, rush["slope_factor"])
+        if enable_rush:
+            pressure = calc_pressure_test(close, rush["slope_factor"])
+        else:
+            pressure = {"premium": "未开启测压", "pl_ratio": "-", "a50_pct": "-"}
 
         # 东财链接
         link = f"https://quote.eastmoney.com/concept/{code}.html"
@@ -566,7 +567,7 @@ def main():
 
         st.divider()
         enable_rush_detection = st.checkbox("开启抢筹识别（耗时较长）", value=False)
-        st.caption(f"数据缓存: 尾盘10分钟 / 非尾盘1小时")
+        st.caption(f"数据缓存: 10分钟（点击下方按钮手动刷新）")
         st.caption(f"尾盘时段: {TAIL_SESSION_START.strftime('%H:%M')} - 15:00")
 
         if st.button("🔄 手动刷新数据", use_container_width=True):
