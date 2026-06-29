@@ -1,4 +1,4 @@
-# app.py - 尾盘智能选股工具（稳定版）
+# app.py - 尾盘智能选股工具（完整修复版）
 # -*- coding: utf-8 -*-
 import streamlit as st
 import akshare as ak
@@ -19,6 +19,19 @@ def beijing_now() -> datetime:
 
 def today_str() -> str:
     return beijing_now().strftime("%Y-%m-%d")
+
+def is_tail_time() -> bool:
+    """判断当前是否处于尾盘时段（14:30-15:00，A股收盘前30分钟）"""
+    now = beijing_now()
+    # A股交易时间：9:30-11:30, 13:00-15:00
+    # 尾盘抢筹分析应在14:30-15:00进行
+    return (now.hour == 14 and now.minute >= 30) or (now.hour == 15 and now.minute == 0)
+
+def is_trading_day() -> bool:
+    """判断今天是否为交易日（简单判断：周一至周五且非法定节假日）"""
+    now = beijing_now()
+    # 简单判断：周一(0)到周五(4)
+    return now.weekday() < 5
 
 # ============================================================
 # 全局配置
@@ -54,13 +67,47 @@ def _get_column(df: pd.DataFrame, candidates: list) -> str | None:
 # ============================================================
 @st.cache_data(ttl=600)
 def fetch_realtime_quotes():
+    """获取实时行情数据（带列名兼容性检查）"""
     try:
         df = ak.stock_zh_a_spot_em()
+        if df is None or df.empty:
+            return None
+        # 列名映射（兼容不同版本的akshare）
+        column_mapping = {
+            "代码": ["代码", "code", "股票代码"],
+            "名称": ["名称", "name", "股票名称"],
+            "涨跌幅": ["涨跌幅", "涨跌幅%", "change_pct", "涨幅"],
+            "量比": ["量比", "volume_ratio", "量比(当日)"],
+            "成交额": ["成交额", "amount", "成交金额"],
+            "换手率": ["换手率", "turnover", "换手率%"],
+            "最新价": ["最新价", "price", "收盘价", "现价"],
+        }
+        mapped_cols = {}
+        for std_name, aliases in column_mapping.items():
+            found = _get_column(df, aliases)
+            if found:
+                mapped_cols[found] = std_name
+        if mapped_cols:
+            df = df.rename(columns=mapped_cols)
         required_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            st.warning(f"⚠️ 缺失列: {missing}，请检查数据源接口")
-            return None
+            st.warning(f"⚠️ 数据源列名不匹配，缺失: {missing}。尝试自动适配...")
+            # 尝试从原始列名中推断
+            for col in df.columns:
+                for req in required_cols:
+                    if req in col or col in req:
+                        df = df.rename(columns={col: req})
+                        break
+            missing = [c for c in required_cols if c not in df.columns]
+            if missing:
+                st.error(f"❌ 无法识别必要列: {missing}，请检查 akshare 版本")
+                return None
+        # 数据类型转换
+        numeric_cols = ["涨跌幅", "量比", "成交额", "换手率", "最新价"]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
     except Exception as e:
         st.error(f"获取实时行情失败: {e}")
@@ -68,67 +115,110 @@ def fetch_realtime_quotes():
 
 @st.cache_data(ttl=600)
 def fetch_daily_kline(symbol: str, days: int = 30):
+    """获取个股日K线数据"""
     try:
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq", start_date="20240101")
-        if df.empty:
+        end_date = beijing_now().strftime("%Y%m%d")
+        start_date = (beijing_now() - timedelta(days=days*2)).strftime("%Y%m%d")
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq", 
+                                start_date=start_date, end_date=end_date)
+        if df is None or df.empty:
             return None
         close_col = _get_column(df, ["收盘", "close"])
         if close_col is None:
             return None
         df = df.rename(columns={close_col: "close"})
-        return df.tail(days)
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        return df.dropna(subset=["close"]).tail(days)
     except Exception:
         return None
 
 @st.cache_data(ttl=60)
 def fetch_intraday_minute(symbol: str):
-    """获取当日1分钟分时数据（仅保留已知可用接口）"""
-    try:
-        df = ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")
-        if df is None or df.empty:
-            return None
-        vol_col = _get_column(df, ["成交量", "volume", "vol"])
-        close_col = _get_column(df, ["收盘", "close", "price"])
-        if vol_col is None or close_col is None:
-            return None
-        df = df.rename(columns={vol_col: "volume", close_col: "close"})
-        return df
-    except Exception:
-        return None
-
-@st.cache_data(ttl=300)
-def fetch_a50_night_change() -> float:
-    """获取富时A50夜盘涨跌幅（降级容错）"""
+    """获取当日1分钟分时数据（降级容错）"""
     methods = [
-        ("stock_fta50_hist_sina", lambda: ak.stock_fta50_hist_sina(symbol="a50")),
-        ("futures_zh_minute_sina", lambda: ak.futures_zh_minute_sina(symbol="A50")),
+        ("stock_zh_a_hist_min_em", lambda: ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")),
+        ("stock_zh_a_spot_min_em", lambda: ak.stock_zh_a_spot_min_em(symbol=symbol, period="1")),
     ]
     for name, func in methods:
         try:
             df = func()
-            if df is None or df.empty or len(df) < 2:
+            if df is None or df.empty:
                 continue
-            price_col = _get_column(df, ["收盘", "close", "最新价", "price", "最新"])
-            if price_col is None:
+            vol_col = _get_column(df, ["成交量", "volume", "vol", "VOL"])
+            close_col = _get_column(df, ["收盘", "close", "price", "最新价"])
+            if vol_col is None or close_col is None:
                 continue
-            prices = pd.to_numeric(df[price_col], errors="coerce").dropna()
-            if len(prices) < 2:
-                continue
-            latest, prev = prices.iloc[-1], prices.iloc[-2]
-            if prev == 0:
-                return 0.0
-            return round((latest - prev) / prev * 100, 2)
+            df = df.rename(columns={vol_col: "volume", close_col: "close"})
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            return df.dropna(subset=["volume", "close"])
+        except Exception:
+            continue
+    return None
+
+@st.cache_data(ttl=300)
+def fetch_a50_change() -> float:
+    """获取富时A50涨跌幅（降级容错）"""
+    methods = [
+        ("stock_fta50_hist_sina", lambda: _fetch_a50_sina()),
+        ("futures_zh_minute_sina", lambda: _fetch_a50_futures()),
+    ]
+    for name, func in methods:
+        try:
+            result = func()
+            if result is not None:
+                return result
         except Exception:
             continue
     return 0.0
+
+def _fetch_a50_sina() -> float | None:
+    """从新浪获取A50数据"""
+    try:
+        df = ak.stock_fta50_hist_sina(symbol="a50")
+        if df is None or df.empty or len(df) < 2:
+            return None
+        price_col = _get_column(df, ["收盘", "close", "最新价", "price"])
+        if price_col is None:
+            return None
+        prices = pd.to_numeric(df[price_col], errors="coerce").dropna()
+        if len(prices) < 2:
+            return None
+        latest, prev = prices.iloc[-1], prices.iloc[-2]
+        if prev == 0:
+            return 0.0
+        return round((latest - prev) / prev * 100, 2)
+    except Exception:
+        return None
+
+def _fetch_a50_futures() -> float | None:
+    """从期货接口获取A50数据"""
+    try:
+        df = ak.futures_zh_minute_sina(symbol="A50")
+        if df is None or df.empty or len(df) < 2:
+            return None
+        price_col = _get_column(df, ["收盘价", "close", "price"])
+        if price_col is None:
+            return None
+        prices = pd.to_numeric(df[price_col], errors="coerce").dropna()
+        if len(prices) < 2:
+            return None
+        latest, prev = prices.iloc[-1], prices.iloc[-2]
+        if prev == 0:
+            return 0.0
+        return round((latest - prev) / prev * 100, 2)
+    except Exception:
+        return None
 
 # ============================================================
 # 选股逻辑
 # ============================================================
 def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
+    """计算尾盘抢筹强度"""
     if df_1min is None or len(df_1min) < 10:
         return {"label": "数据不足", "score": 0, "detail": ""}
     try:
+        # 取最后30分钟的数据
         last_30 = df_1min.tail(30)
         if len(last_30) < 5:
             return {"label": "数据不足", "score": 0, "detail": ""}
@@ -137,11 +227,14 @@ def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
         total_vol = vols.sum()
         last5_vol = vols[-5:].sum() if len(vols) >= 5 else total_vol
         last5_ratio = last5_vol / total_vol if total_vol > 0 else 0
+        # 计算价格斜率
         x = np.arange(len(closes))
         slope = np.polyfit(x, closes, 1)[0]
         slope_factor = max(slope / closes[0] * 100, 0.0) if closes[0] != 0 else 0.0
+        # 综合评分
         score = last5_ratio * 50 + min(slope_factor * 10, 50)
         score = min(score, 100)
+        # 分级
         if score > 70 and last5_ratio > 0.25 and slope_factor > 0.08:
             strength = "强" if last5_ratio > 0.35 else "中"
             label = f"真抢筹({strength})"
@@ -161,37 +254,34 @@ def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
 
 def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     """执行完整选股流程"""
-    # 非尾盘时段自动禁用抢筹，并在侧边栏同步状态
+    # 判断是否为尾盘时段
     now = beijing_now()
-    is_tail_session = now.hour >= 14 and now.hour < 16
-    if not is_tail_session:
+    tail_time = is_tail_time()
+    # 非尾盘时段自动禁用抢筹分析
+    if not tail_time:
         enable_rush = False
-
-    # 将禁用状态写回 session_state，供侧边栏显示
-    st.session_state["rush_auto_disabled"] = not is_tail_session
-
-    # 非尾盘提示（在 spinner 之前显示，避免叠加）
-    if not is_tail_session:
-        st.info("ℹ️ 当前非尾盘时段，抢筹分析已自动跳过")
-
-    progress = st.progress(0.0, text="⏰ 尾盘时段已到，正在运行选股逻辑，请稍候...")
+    # 将状态写入 session_state
+    st.session_state["rush_auto_disabled"] = not tail_time
+    # 非尾盘提示（在进度条之前显示）
+    if not tail_time:
+        st.info("ℹ️ 当前非尾盘时段（14:30-15:00），抢筹分析已自动跳过。可查看历史数据或手动运行。")
+    # 进度条
     status_text = st.empty()
-
+    progress = st.progress(0.0, text="正在初始化...")
+    status_text.text("⏳ 准备获取实时行情...")
     df = fetch_realtime_quotes()
     if df is None:
-        st.error("无法获取实时行情，请稍后重试")
+        st.error("❌ 无法获取实时行情，请检查网络或稍后重试")
         return None
-
     config = get_config()
     total = len(df)
     results = []
     rush_cache = {}
     errors = 0
-
-    for i, row in df.iterrows():
-        if i % 5 == 0:
+    for i, (idx, row) in enumerate(df.iterrows()):
+        if i % 10 == 0:
             progress.progress((i + 1) / total, text=f"⏳ 正在分析 {i+1}/{total} ...")
-            status_text.text(f"📊 已筛选 {len(results)} 只候选股")
+            status_text.text(f"📊 已筛选 {len(results)} 只候选股（已处理 {i+1}/{total}）")
         try:
             symbol = str(row["代码"]).zfill(6)
             name = str(row["名称"])
@@ -200,7 +290,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             amount = float(row["成交额"])
             turnover = float(row["换手率"])
             close = float(row.get("最新价", 0))
-
+            # 筛选条件
             if not (config["pct_min"] < chg < config["pct_max"]):
                 continue
             if vol_ratio < config["vol_ratio_min"]:
@@ -209,14 +299,13 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
                 continue
             if amount < config["amount_min"]:
                 continue
-
+            # 抢筹分析（如果启用）
             if enable_rush:
                 if symbol not in rush_cache:
                     rush_cache[symbol] = calc_intraday_rush(fetch_intraday_minute(symbol))
                 rush = rush_cache[symbol]
             else:
                 rush = {"label": "-", "score": 0, "detail": "-"}
-
             results.append({
                 "代码": symbol,
                 "名称": name,
@@ -229,19 +318,19 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
                 "抢筹评分": rush["score"],
                 "_sort_key": vol_ratio,
             })
-        except Exception:
+        except Exception as e:
             errors += 1
             continue
-
     progress.progress(1.0, text="✅ 选股完成！")
+    status_text.text(f"✅ 选股完成！共找到 {len(results)} 只候选股")
     if not results:
-        st.warning("未找到符合条件的股票，请调整筛选条件")
+        st.warning("⚠️ 未找到符合条件的股票，请调整筛选条件或稍后重试")
         return None
-
+    # 按量比排序
     results.sort(key=lambda x: x["_sort_key"], reverse=True)
     df_result = pd.DataFrame(results[:max_stocks])
     df_result = df_result.drop(columns=["_sort_key"])
-
+    # 统计摘要
     summary = {
         "total_stocks": total,
         "passed": len(results),
@@ -272,6 +361,7 @@ def save_daily_results(df: pd.DataFrame):
     st.session_state["last_results_ts"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
 
 def load_daily_results(date_str: str) -> pd.DataFrame | None:
+    """加载指定日期的选股结果"""
     history = st.session_state.get("history_results", {})
     record = history.get(date_str)
     if record is None:
@@ -279,6 +369,7 @@ def load_daily_results(date_str: str) -> pd.DataFrame | None:
     return pd.DataFrame(record["data"])
 
 def load_last_results() -> tuple[pd.DataFrame | None, str | None]:
+    """加载最近一次选股结果"""
     df = st.session_state.get("last_results")
     ts = st.session_state.get("last_results_ts")
     return df, ts
@@ -287,21 +378,25 @@ def load_last_results() -> tuple[pd.DataFrame | None, str | None]:
 # 页面渲染函数
 # ============================================================
 def render_summary_panel():
+    """渲染统计摘要面板"""
     summary = st.session_state.get("last_summary")
     if summary is None:
         return
+    st.subheader("📊 选股统计摘要")
     cols = st.columns(6)
-    cols[0].metric("📊 总股票数", summary["total_stocks"])
-    cols[1].metric("✅ 通过筛选", f"{summary['passed']} 只")
-    cols[2].metric("📋 展示数量", f"{summary['displayed']} 只")
-    cols[3].metric("📈 平均涨幅", f"{summary['avg_pct']}%")
-    cols[4].metric("🔥 最大量比", summary["max_vol_ratio"])
-    cols[5].metric("⚠️ 数据异常", summary["errors"])
+    cols[0].metric("总股票数", summary["total_stocks"])
+    cols[1].metric("通过筛选", f"{summary['passed']} 只")
+    cols[2].metric("展示数量", f"{summary['displayed']} 只")
+    cols[3].metric("平均涨幅", f"{summary['avg_pct']}%")
+    cols[4].metric("最大量比", summary["max_vol_ratio"])
+    cols[5].metric("数据异常", summary["errors"])
     if summary.get("rush_distribution"):
         rush_str = " | ".join([f"{k}:{v}" for k, v in summary["rush_distribution"].items()])
         st.caption(f"🏷️ 抢筹分布：{rush_str}")
+    st.divider()
 
 def render_yesterday_review():
+    """渲染昨日回顾面板"""
     today = today_str()
     yesterday = (beijing_now() - timedelta(days=1)).strftime("%Y-%m-%d")
     df_today = load_daily_results(today)
@@ -309,20 +404,23 @@ def render_yesterday_review():
     if df_today is None and df_yesterday is None:
         st.caption("📅 暂无历史数据，运行选股后自动记录")
         return
-    st.subheader("📅 昨日回顾")
+    st.subheader("📅 历史对比")
     col1, col2 = st.columns(2)
     with col1:
         st.caption(f"📌 今日 ({today})")
         if df_today is not None and not df_today.empty:
-            st.dataframe(df_today[["代码", "名称", "涨跌幅%", "量比", "抢筹"]], use_container_width=True)
+            st.dataframe(df_today[["代码", "名称", "涨跌幅%", "量比", "抢筹"]], 
+                        use_container_width=True, hide_index=True)
         else:
             st.text("今日暂无数据")
     with col2:
         st.caption(f"📌 昨日 ({yesterday})")
         if df_yesterday is not None and not df_yesterday.empty:
-            st.dataframe(df_yesterday[["代码", "名称", "涨跌幅%", "量比", "抢筹"]], use_container_width=True)
+            st.dataframe(df_yesterday[["代码", "名称", "涨跌幅%", "量比", "抢筹"]], 
+                        use_container_width=True, hide_index=True)
         else:
             st.text("昨日暂无数据")
+    # 连续上榜分析
     if df_today is not None and df_yesterday is not None:
         today_codes = set(df_today["代码"].astype(str))
         yesterday_codes = set(df_yesterday["代码"].astype(str))
@@ -334,9 +432,23 @@ def render_yesterday_review():
                     lambda x: f"⭐ {x}" if not str(x).startswith("⭐") else x
                 )
             st.success(f"⭐ 连续上榜：{len(overlap)} 只股票")
-            st.dataframe(overlap_df[["代码", "名称", "涨跌幅%", "量比", "抢筹"]], use_container_width=True)
+            st.dataframe(overlap_df[["代码", "名称", "涨跌幅%", "量比", "抢筹"]], 
+                        use_container_width=True, hide_index=True)
         else:
-            st.info("今日与昨日无重叠股票，市场风格可能切换")
+            st.info("📊 今日与昨日无重叠股票，市场风格可能切换")
+
+def render_a50_panel():
+    """渲染A50夜盘涨跌面板"""
+    a50_change = fetch_a50_change()
+    if a50_change is None:
+        st.caption("⚠️ 无法获取A50数据")
+        return
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if a50_change > 0:
+            st.metric("富时A50", f"+{a50_change:.2f}%", delta=f"{a50_change:.2f}%")
+        else:
+            st.metric("富时A50", f"{a50_change:.2f}%", delta=f"{a50_change:.2f}%")
 
 # ============================================================
 # Streamlit 主页面
@@ -348,56 +460,61 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 st.title("📈 尾盘智能选股工具")
-st.caption("基于 akshare 实时数据 + 尾盘抢筹分析")
+st.caption("基于 akshare 实时数据 + 尾盘抢筹分析（A股专用）")
 
 # ---- 侧边栏 ----
 with st.sidebar:
     st.header("⚙️ 参数设置")
     now = beijing_now()
-    is_tail_session = now.hour >= 14 and now.hour < 16
-    if is_tail_session:
-        st.success("✅ 已进入尾盘时段（14:00-16:00）")
+    tail_time = is_tail_time()
+    trading_day = is_trading_day()
+    # 时段提示
+    if tail_time and trading_day:
+        st.success("✅ 已进入尾盘时段（14:30-15:00），可启用抢筹分析")
+    elif trading_day:
+        st.info("ℹ️ 当前为交易时段，但非尾盘时间（尾盘分析将在14:30后可用）")
     else:
-        st.warning("⚠️ 当前非尾盘时段，展示上次结果或手动运行")
-
-    # 侧边栏同步显示抢筹分析状态
-    rush_disabled = st.session_state.get("rush_auto_disabled", False)
-    if rush_disabled:
-        st.info("ℹ️ 抢筹分析已自动禁用（非尾盘时段）")
-
-    enable_rush = st.checkbox("🔍 启用尾盘抢筹分析", value=is_tail_session)
+        st.warning("⚠️ 今日非交易日，展示历史数据或手动运行")
+    # 抢筹分析开关（非尾盘时段禁用）
+    enable_rush = st.checkbox(
+        "🔍 启用尾盘抢筹分析", 
+        value=tail_time and trading_day,
+        disabled=not (tail_time and trading_day),
+        help="仅在尾盘时段（14:30-15:00）可用" if not (tail_time and trading_day) else "分析尾盘抢筹强度"
+    )
+    if not (tail_time and trading_day):
+        st.caption("ℹ️ 抢筹分析已禁用（非尾盘时段）")
     max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 30, 5)
-
     st.divider()
-    if st.button("🔄 运行选股", use_container_width=True):
+    # 运行按钮
+    if st.button("🔄 运行选股", use_container_width=True, type="primary"):
         with st.spinner("正在运行选股逻辑..."):
             df = run_selection(enable_rush, max_stocks)
             if df is not None:
                 save_daily_results(df)
                 st.success(f"✅ 选股完成，共 {len(df)} 只候选股")
                 st.rerun()
-
     if st.button("🗑️ 清除缓存并刷新", use_container_width=True):
         st.cache_data.clear()
         st.session_state["last_summary"] = None
         st.rerun()
-
     if st.button("🗑️ 清空历史数据", use_container_width=True):
         for key in ["history_results", "last_results", "last_results_ts", "last_summary", "rush_auto_disabled"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.success("✅ 历史数据已清空")
         st.rerun()
-
     st.divider()
     st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
     st.caption("数据来源：akshare")
 
 # ---- 主页面 ----
+# 渲染A50面板
+render_a50_panel()
+# 渲染统计摘要
 render_summary_panel()
-
+# 加载并显示最近结果
 df_result, cached_ts = load_last_results()
-
 if df_result is not None and not df_result.empty:
     st.subheader(f"📊 候选股票列表（共 {len(df_result)} 只）")
     if cached_ts:
@@ -418,6 +535,7 @@ if df_result is not None and not df_result.empty:
         use_container_width=True,
         hide_index=True,
     )
+    # 导出CSV
     csv_data = df_result.to_csv(index=False, encoding="utf-8-sig")
     st.download_button(
         label="📥 导出 CSV",
@@ -427,10 +545,8 @@ if df_result is not None and not df_result.empty:
     )
 else:
     st.info("💡 暂无选股结果，请点击侧边栏「运行选股」按钮")
-
 st.divider()
 render_yesterday_review()
-
 st.divider()
 st.caption(f"🔄 数据更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）")
 st.caption("⚠️ 以上内容仅供参考，不构成投资建议。股市有风险，投资需谨慎。")
