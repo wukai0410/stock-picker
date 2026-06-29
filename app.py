@@ -110,25 +110,6 @@ def fetch_realtime_quotes():
         st.error(f"获取实时行情失败: {e}")
         return None
 
-@st.cache_data(ttl=600)
-def fetch_daily_kline(symbol: str, days: int = 30):
-    """获取个股日K线数据"""
-    try:
-        end_date = beijing_now().strftime("%Y%m%d")
-        start_date = (beijing_now() - timedelta(days=days*2)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq",
-                                start_date=start_date, end_date=end_date)
-        if df is None or df.empty:
-            return None
-        close_col = _get_column(df, ["收盘", "close"])
-        if close_col is None:
-            return None
-        df = df.rename(columns={close_col: "close"})
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        return df.dropna(subset=["close"]).tail(days)
-    except Exception:
-        return None
-
 @st.cache_data(ttl=60)
 def fetch_intraday_minute(symbol: str):
     """获取当日1分钟分时数据（仅保留已知可用接口）"""
@@ -217,7 +198,8 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     # 非尾盘时段自动禁用抢筹分析
     if not tail_time:
         enable_rush = False
-    # 将状态写入 session_state
+    # 将实际状态写入 session_state
+    st.session_state["rush_actual_enabled"] = enable_rush
     st.session_state["rush_auto_disabled"] = not tail_time
     # 非尾盘提示（在进度条之前显示）
     if not tail_time:
@@ -304,7 +286,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
 # 结果存储
 # ============================================================
 def save_daily_results(df: pd.DataFrame):
-    """保存当日选股结果（含空数据检查）"""
+    """保存当日选股结果（含空数据检查和30天清理）"""
     if df is None or df.empty:
         return
     today = today_str()
@@ -314,6 +296,11 @@ def save_daily_results(df: pd.DataFrame):
         "data": df.to_dict(orient="records"),
         "timestamp": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    # 30天清理机制
+    if len(st.session_state["history_results"]) > 30:
+        sorted_dates = sorted(st.session_state["history_results"].keys())
+        for old_date in sorted_dates[:-30]:
+            del st.session_state["history_results"][old_date]
     st.session_state["last_results"] = df
     st.session_state["last_results_ts"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -441,6 +428,13 @@ with st.sidebar:
     )
     if not (tail_time and trading_day):
         st.caption("ℹ️ 抢筹分析已禁用（非尾盘时段）")
+    else:
+        # 显示抢筹实际状态
+        rush_actual = st.session_state.get("rush_actual_enabled", enable_rush)
+        if rush_actual:
+            st.caption("✅ 抢筹分析：已启用")
+        else:
+            st.caption("ℹ️ 抢筹分析：已禁用")
     max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 30, 5)
     st.divider()
     # 运行按钮
