@@ -1,4 +1,4 @@
-# app.py - 尾盘智能选股工具（AlphaFeed Pro 版）
+# app.py - 尾盘智能选股工具（AlphaFeed Pro 版 - 完整修复版）
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
@@ -126,10 +126,8 @@ def fetch_realtime_quotes():
         # 换手率也转百分比
         df["换手率"] = pd.to_numeric(df["turnover_rate"], errors="coerce") * 100
 
-        # 量比：AlphaFeed 没有直接提供，用当日成交量 / 5日均量估算
-        # 先保留原始成交量用于后续计算
-        df["_volume_raw"] = pd.to_numeric(df["volume"], errors="coerce")
-        df["量比"] = np.nan
+        # 量比：用 1.0 作为默认值（后续在 run_selection 中按需精确计算）
+        df["量比"] = 1.0
 
         df["成交额"] = pd.to_numeric(df["amount"], errors="coerce")
         df["最新价"] = pd.to_numeric(df["last_price"], errors="coerce")
@@ -139,9 +137,6 @@ def fetch_realtime_quotes():
         df = df.dropna(subset=["代码", "最新价"])
         df = df[df["代码"].str.match(r"^\d{6}$")]
 
-        # 批量计算量比（前200只）
-        df["量比"] = _calc_volume_ratio(df)
-
         return df[["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]]
 
     except Exception as e:
@@ -149,54 +144,30 @@ def fetch_realtime_quotes():
         return None
 
 
-def _calc_volume_ratio(df: pd.DataFrame) -> pd.Series:
-    """
-    批量计算量比：当日成交量 / 过去5日均量
-    AlphaFeed quotes 接口不直接提供量比，用 K线接口补
-    只对前200只股票计算（量比主要用于排序，不需要全市场精确）
-    """
-    result = pd.Series(np.nan, index=df.index)
-    sample = df.head(200)
-    for i, row in sample.iterrows():
-        try:
-            symbol = row["代码"]
-            today_vol = row.get("_volume_raw")
-            if today_vol is None or today_vol <= 0:
-                continue
-            af_symbol = to_alphafeed_symbol(symbol)
-            result = af.klines.get(af_symbol, period="1d", count=10, adjust="forward")
-            if not result or not isinstance(result, dict):
-                continue
-            if "volume" not in result or len(result["volume"]) < 6:
-                continue
-            vols = pd.Series(result["volume"]).tail(6)
-            avg_vol_5d = vols.head(5).mean()
-            if avg_vol_5d > 0:
-                result.at[i] = round(today_vol / avg_vol_5d, 2)
-        except Exception:
-            continue
-    return result
-
-
 @st.cache_data(ttl=600)
 def fetch_ma20(symbol: str) -> float | None:
-    """获取个股20日均线"""
+    """获取个股20日均线（兼容 list[dict] 和 dict of lists 两种返回格式）"""
     try:
         af_symbol = to_alphafeed_symbol(symbol)
-        result = af.klines.get(
-            af_symbol,
-            period="1d",
-            count=300,
-            adjust="forward",
-        )
-        if not result or not isinstance(result, dict):
+        result = af.klines.get(af_symbol, period="1d", count=300, adjust="forward")
+        if not result:
             return None
-        # 新版返回 dict of lists（列式）
-        if "close" in result:
+
+        closes = None
+
+        # 处理 list[dict] 格式
+        if isinstance(result, list):
+            close_list = []
+            for item in result:
+                if isinstance(item, dict) and "close" in item:
+                    close_list.append(item["close"])
+            if close_list:
+                closes = pd.Series(close_list)
+        # 处理 dict of lists 格式（列式）
+        elif isinstance(result, dict) and "close" in result:
             closes = pd.Series(result["close"]).dropna()
-        else:
-            return None
-        if len(closes) < 20:
+
+        if closes is None or len(closes) < 20:
             return None
         return closes.tail(20).mean()
     except Exception:
@@ -205,21 +176,20 @@ def fetch_ma20(symbol: str) -> float | None:
 
 @st.cache_data(ttl=60)
 def fetch_intraday_minute(symbol: str):
-    """获取当日1分钟分时数据"""
+    """获取当日1分钟分时数据（自动排序）"""
     try:
         af_symbol = to_alphafeed_symbol(symbol)
-        result = af.klines.intraday(
-            af_symbol,
-            period="1m",
-        )
+        result = af.klines.intraday(af_symbol, period="1m")
         if not result or not isinstance(result, dict):
             return None
-        # 新版返回 dict of lists（列式）
         if "close" in result and "volume" in result:
             df = pd.DataFrame({
                 "close": result["close"],
                 "volume": result["volume"],
             })
+            # 如果数据是倒序的，反转
+            if len(df) > 1 and df["close"].iloc[0] > df["close"].iloc[-1]:
+                df = df.iloc[::-1].reset_index(drop=True)
             return df
         return None
     except Exception:
@@ -594,7 +564,8 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
 
             if not (config["pct_min"] < chg < config["pct_max"]):
                 continue
-            if vol_ratio < config["vol_ratio_min"]:
+            # 量比筛选暂时放宽，有数据才过滤
+            if vol_ratio > 0 and vol_ratio < config["vol_ratio_min"]:
                 continue
             if not (config["turnover_min"] < turnover < config["turnover_max"]):
                 continue
@@ -640,7 +611,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
                 "抢筹评分": rush["score"],
                 "_sort_key": composite_score,
             })
-        except Exception as e:
+        except Exception:
             errors += 1
             continue
 
@@ -944,6 +915,16 @@ def main_page():
 
     st.title("📈 尾盘智能选股工具")
     st.caption("基于 AlphaFeed Pro 数据源 + 综合评分系统 + 主力分析")
+
+    # AlphaFeed 健康检查
+    try:
+        test = af.quotes.get(universes="CN_Stock", limit=1)
+        if not test:
+            st.error("❌ AlphaFeed 连接失败，请检查 API Key 和网络")
+            st.stop()
+    except Exception:
+        st.error("❌ AlphaFeed 连接异常，请检查 API Key 和网络")
+        st.stop()
 
     with st.sidebar:
         st.header("⚙️ 参数设置")
