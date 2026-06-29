@@ -225,43 +225,68 @@ def fetch_a50_change() -> float:
 
 
 # ============================================================
-# 资金流向（akshare 龙虎榜兜底）
+# 资金流向（东方财富逐日资金流向，近10日汇总）
 # ============================================================
-@st.cache_data(ttl=3600)
+def _get_market_suffix(symbol: str) -> str:
+    """600/601/603/605 -> sh; 000/001/002/003/300/301/688 -> sz"""
+    code = symbol.zfill(6)
+    if code.startswith(('6',)):
+        return 'sh'
+    else:
+        return 'sz'
+
+@st.cache_data(ttl=600)
 def fetch_fund_flow(symbol: str) -> dict:
+    """
+    获取个股近10日资金流向（机构/大户/散户），使用东方财富逐日数据
+    返回: {institution, big_trader, retail, available, source}
+    """
     result = {
         "institution": {"流入": 0, "流出": 0, "净额": 0},
         "big_trader": {"流入": 0, "流出": 0, "净额": 0},
+        "retail": {"流入": 0, "流出": 0, "净额": 0},
         "available": False,
         "source": None
     }
     try:
         import akshare as ak
-        df = ak.stock_lhb_em(symbol=symbol)
-        if df is not None and not df.empty:
-            df = df.head(10)
-            if "买方席位名称" in df.columns:
-                inst_mask = df["买方席位名称"].str.contains("机构", na=False) | df["卖方席位名称"].str.contains("机构", na=False)
-                inst_data = df[inst_mask]
-                if not inst_data.empty:
-                    inst_in = inst_data[inst_data["买卖方向"] == "买入"]["成交额"].sum() / 1e8
-                    inst_out = inst_data[inst_data["买卖方向"] == "卖出"]["成交额"].sum() / 1e8
-                    result["institution"]["流入"] = round(inst_in, 2)
-                    result["institution"]["流出"] = round(inst_out, 2)
-                    result["institution"]["净额"] = round(inst_in - inst_out, 2)
-                    result["available"] = True
-                    result["source"] = "龙虎榜"
+        market = _get_market_suffix(symbol)
+        df = ak.stock_individual_fund_flow(stock=symbol, market=market)
+        if df is None or df.empty:
+            return result
 
-                non_inst_mask = ~df["买方席位名称"].str.contains("机构", na=False) & ~df["卖方席位名称"].str.contains("机构", na=False)
-                bt_data = df[non_inst_mask]
-                if not bt_data.empty:
-                    bt_in = bt_data[bt_data["买卖方向"] == "买入"]["成交额"].sum() / 1e8
-                    bt_out = bt_data[bt_data["买卖方向"] == "卖出"]["成交额"].sum() / 1e8
-                    result["big_trader"]["流入"] = round(bt_in, 2)
-                    result["big_trader"]["流出"] = round(bt_out, 2)
-                    result["big_trader"]["净额"] = round(bt_in - bt_out, 2)
-                    result["available"] = True
-                    result["source"] = "龙虎榜"
+        # 取近10日
+        recent = df.tail(10).copy()
+
+        # 超大单 ≈ 机构，大单 ≈ 大户，小单 ≈ 散户
+        # 主力 = 超大单 + 大单
+        # 列名: 超大单净流入-净额, 大单净流入-净额, 小单净流入-净额
+        inst_col = "超大单净流入-净额"
+        big_col = "大单净流入-净额"
+        retail_col = "小单净流入-净额"
+
+        if inst_col not in recent.columns:
+            return result
+
+        inst_net = recent[inst_col].sum()
+        big_net = recent[big_col].sum() if big_col in recent.columns else 0
+        retail_net = recent[retail_col].sum() if retail_col in recent.columns else 0
+
+        # 净额 >0 表示流入，<0 表示流出
+        result["institution"]["净额"] = round(inst_net / 1e8, 2)
+        result["big_trader"]["净额"] = round(big_net / 1e8, 2)
+        result["retail"]["净额"] = round(retail_net / 1e8, 2)
+
+        # 流入/流出拆分
+        result["institution"]["流入"] = round(max(inst_net, 0) / 1e8, 2)
+        result["institution"]["流出"] = round(abs(min(inst_net, 0)) / 1e8, 2)
+        result["big_trader"]["流入"] = round(max(big_net, 0) / 1e8, 2)
+        result["big_trader"]["流出"] = round(abs(min(big_net, 0)) / 1e8, 2)
+        result["retail"]["流入"] = round(max(retail_net, 0) / 1e8, 2)
+        result["retail"]["流出"] = round(abs(min(retail_net, 0)) / 1e8, 2)
+
+        result["available"] = True
+        result["source"] = "东方财富逐日资金流向"
     except Exception:
         pass
     return result
@@ -272,13 +297,16 @@ def get_fund_flow_summary(symbol: str) -> dict:
         return {"has_data": False, "message": "暂无近10日资金流向数据"}
     inst = data["institution"]
     big = data["big_trader"]
+    retail = data["retail"]
     inst_status = "净流入" if inst["净额"] > 0 else ("净流出" if inst["净额"] < 0 else "持平")
     big_status = "净流入" if big["净额"] > 0 else ("净流出" if big["净额"] < 0 else "持平")
+    retail_status = "净流入" if retail["净额"] > 0 else ("净流出" if retail["净额"] < 0 else "持平")
     return {
         "has_data": True,
-        "source": data.get("source", "龙虎榜"),
+        "source": data.get("source", "东方财富"),
         "institution": {"流入": inst["流入"], "流出": inst["流出"], "净额": inst["净额"], "status": inst_status},
-        "big_trader": {"流入": big["流入"], "流出": big["流出"], "净额": big["净额"], "status": big_status}
+        "big_trader": {"流入": big["流入"], "流出": big["流出"], "净额": big["净额"], "status": big_status},
+        "retail": {"流入": retail["流入"], "流出": retail["流出"], "净额": retail["净额"], "status": retail_status},
     }
 
 
@@ -863,13 +891,13 @@ def render_stock_detail(symbol: str):
         fund_data = get_fund_flow_summary(str(symbol))
 
     if fund_data.get("has_data", False):
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
 
         with col1:
             inst = fund_data["institution"]
             st.markdown(f"""
             <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;">
-                <h4 style="margin:0 0 8px 0;">🏦 机构资金</h4>
+                <h4 style="margin:0 0 8px 0;">🏦 机构资金（超大单）</h4>
                 <table style="width:100%;border-collapse:collapse;">
                     <tr><td style="padding:4px 0;">流入</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#52c41a;">{inst['流入']:.2f} 亿</td></tr>
                     <tr><td style="padding:4px 0;">流出</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#ff4d4f;">{inst['流出']:.2f} 亿</td></tr>
@@ -885,7 +913,7 @@ def render_stock_detail(symbol: str):
             big = fund_data["big_trader"]
             st.markdown(f"""
             <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;">
-                <h4 style="margin:0 0 8px 0;">👤 大户资金</h4>
+                <h4 style="margin:0 0 8px 0;">👤 大户资金（大单）</h4>
                 <table style="width:100%;border-collapse:collapse;">
                     <tr><td style="padding:4px 0;">流入</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#52c41a;">{big['流入']:.2f} 亿</td></tr>
                     <tr><td style="padding:4px 0;">流出</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#ff4d4f;">{big['流出']:.2f} 亿</td></tr>
@@ -897,7 +925,23 @@ def render_stock_detail(symbol: str):
             </div>
             """, unsafe_allow_html=True)
 
-        st.caption(f"📌 数据来源：{fund_data.get('source', '龙虎榜')} | 近10日统计")
+        with col3:
+            retail = fund_data["retail"]
+            st.markdown(f"""
+            <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;">
+                <h4 style="margin:0 0 8px 0;">🧑 散户资金（小单）</h4>
+                <table style="width:100%;border-collapse:collapse;">
+                    <tr><td style="padding:4px 0;">流入</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#52c41a;">{retail['流入']:.2f} 亿</td></tr>
+                    <tr><td style="padding:4px 0;">流出</td><td style="padding:4px 0;text-align:right;font-weight:bold;color:#ff4d4f;">{retail['流出']:.2f} 亿</td></tr>
+                    <tr><td style="padding:4px 0;border-top:1px solid #e0e0e0;">净额</td>
+                        <td style="padding:4px 0;text-align:right;font-weight:bold;border-top:1px solid #e0e0e0;color:{'#52c41a' if retail['净额'] >= 0 else '#ff4d4f'};">{retail['净额']:+.2f} 亿</td></tr>
+                    <tr><td style="padding:4px 0;">状态</td>
+                        <td style="padding:4px 0;text-align:right;font-weight:bold;color:{'#52c41a' if retail['净额'] >= 0 else '#ff4d4f'};">{retail['status']}</td></tr>
+                </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.caption(f"📌 数据来源：{fund_data.get('source', '东方财富')} | 近10日统计")
 
         inst_net = fund_data["institution"]["净额"]
         big_net = fund_data["big_trader"]["净额"]
