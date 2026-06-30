@@ -83,19 +83,87 @@ def get_config():
 # ============================================================
 # AlphaFeed Pro 数据获取
 # ============================================================
+# 东方财富全市场行情（主力数据源）
+# ============================================================
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_realtime_quotes():
+def _fetch_eastmoney_market():
     """
-    全市场实时行情（Pro 版：universes="CN_Stock"）
-    返回统一列名：代码、名称、涨跌幅、量比、成交额、换手率、最新价
+    从东方财富 clist 接口获取全市场实时行情。
+    返回 DataFrame：代码、名称、涨跌幅、量比、成交额、换手率、最新价
+    东方财富字段说明：
+      f12=代码, f14=名称, f2=最新价, f3=涨跌幅%, f5=涨跌额,
+      f6=昨日收, f7=开盘, f8=换手率(需*100转%), f9=最高,
+      f10=量比, f11=最低, f15=开盘价, f16=最高, f17=最低,
+      f20=成交额(元), f21=成交量(股)
     """
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://quote.eastmoney.com/",
+        "Accept": "*/*",
+    })
+
+    all_rows = []
+    # 全市场约5500只股票，每页最多~100条（东方财富限制），需分页
+    for page in range(1, 60):
+        params = {
+            "pn": str(page),
+            "pz": "100",       # 每页100条
+            "po": "1",         # 按涨幅排序
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f3",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",  # A股全市场
+            "fields": "f2,f3,f5,f6,f8,f9,f10,f12,f14,f20,f21",
+        }
+        try:
+            resp = session.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            diff_list = (data.get("data") or {}).get("diff") or []
+            if not diff_list:
+                break
+            all_rows.extend(diff_list)
+            if len(diff_list) < 100:
+                break  # 已到末页
+        except Exception:
+            break
+
+    if not all_rows:
+        return None
+
+    df = pd.DataFrame(all_rows)
+
+    # 字段映射
+    result = pd.DataFrame()
+    result["代码"] = df["f12"].astype(str).str.zfill(6)
+    result["名称"] = df["f14"].fillna("")
+    result["最新价"] = pd.to_numeric(df["f2"], errors="coerce")
+    result["涨跌幅"] = pd.to_numeric(df["f3"], errors="coerce")
+    result["量比"] = pd.to_numeric(df["f10"], errors="coerce")
+    result["换手率"] = pd.to_numeric(df["f8"], errors="coerce")  # 已是百分比
+    result["成交额"] = pd.to_numeric(df["f20"], errors="coerce")   # 单位：元
+
+    # 删除无效行
+    result = result.dropna(subset=["代码", "最新价"])
+    result = result[result["代码"].str.match(r"^\d{6}$")]
+    result.reset_index(drop=True, inplace=True)
+    return result
+
+
+# ============================================================
+# AlphaFeed 全市场行情（备用数据源）
+# ============================================================
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_alphafeed_market():
+    """AlphaFeed 备用：提供股票列表+涨跌幅+价格（无成交额/换手率）"""
     try:
         data = af.quotes.get(universes="CN_Stock")
         if not data:
-            st.error("❌ AlphaFeed 返回空数据")
             return None
 
-        # 新版返回 list[dict]，手动构建 DataFrame
         rows = []
         for item in data:
             ext = item.get("ext", {}) or {}
@@ -103,48 +171,58 @@ def fetch_realtime_quotes():
                 "symbol": item.get("symbol", ""),
                 "name": ext.get("name", ""),
                 "last_price": item.get("last_price"),
-                "prev_close": item.get("prev_close"),
-                "open": item.get("open"),
-                "high": item.get("high"),
-                "low": item.get("low"),
-                "amount": item.get("amount"),
-                "volume": item.get("volume"),
                 "change_pct": ext.get("change_pct"),
-                "change_amount": ext.get("change_amount"),
-                "turnover_rate": ext.get("turnover_rate"),
-                "amplitude": ext.get("amplitude"),
             })
         df = pd.DataFrame(rows)
-
         if df.empty:
-            st.error("❌ AlphaFeed 数据解析后为空")
             return None
 
-        # 代码处理：去掉后缀（688252.SH → 688252）
-        df["代码"] = df["symbol"].astype(str).str.replace(r"\.(SH|SZ|BJ)$", "", regex=True)
+        result = pd.DataFrame()
+        result["代码"] = df["symbol"].astype(str).str.replace(r"\.(SH|SZ|BJ)$", "", regex=True).str.zfill(6)
+        result["名称"] = df["name"].fillna("").astype(str)
+        result["最新价"] = pd.to_numeric(df["last_price"], errors="coerce")
+        result["涨跌幅"] = pd.to_numeric(df["change_pct"], errors="coerce") * 100
+        result["量比"] = np.nan
+        result["换手率"] = np.nan
+        result["成交额"] = np.nan
 
-        # 涨跌幅从小数转百分比（如 -0.0094 → -0.94%）
-        df["涨跌幅"] = pd.to_numeric(df["change_pct"], errors="coerce") * 100
-
-        # 换手率也转百分比
-        df["换手率"] = pd.to_numeric(df["turnover_rate"], errors="coerce") * 100
-
-        # 量比：暂用 NaN 占位，后续从东方财富批量获取真实数据
-        df["量比"] = np.nan
-
-        df["成交额"] = pd.to_numeric(df["amount"], errors="coerce")
-        df["最新价"] = pd.to_numeric(df["last_price"], errors="coerce")
-        df["名称"] = df["name"].astype(str)
-
-        # 删除无效行
-        df = df.dropna(subset=["代码", "最新价"])
-        df = df[df["代码"].str.match(r"^\d{6}$")]
-
-        return df[["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]]
-
-    except Exception as e:
-        st.error(f"❌ AlphaFeed 获取实时行情失败: {e}")
+        result = result.dropna(subset=["代码", "最新价"])
+        result = result[result["代码"].str.match(r"^\d{6}$")]
+        return result
+    except Exception:
         return None
+
+
+# ============================================================
+# 统一行情入口（东方财富优先 → AlphaFeed备用）
+# ============================================================
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_realtime_quotes():
+    """
+    全市场实时行情。
+    策略：东方财富clist为主（有完整成交额/换手率/量比），
+         AlphaFeed为备用（仅价格+涨跌幅）。
+    返回统一列名：代码、名称、涨跌幅、量比、成交额、换手率、最新价
+    """
+    # 策略1：东方财富（完整数据）
+    try:
+        em_df = _fetch_eastmoney_market()
+        if em_df is not None and len(em_df) > 500:
+            return em_df
+    except Exception:
+        pass
+
+    # 策略2：AlphaFeed备用（可能缺少成交额/换手率，初筛时放宽条件）
+    try:
+        af_df = _fetch_alphafeed_market()
+        if af_df is not None and len(af_df) > 100:
+            st.warning("⚠️ 东方财富不可用，使用AlphaFeed备用源（部分字段缺失）")
+            return af_df
+    except Exception:
+        pass
+
+    st.error("❌ 所有行情数据源均不可用")
+    return None
 
 
 @st.cache_data(ttl=600)
@@ -454,7 +532,7 @@ def _batch_calc_vol_ratios(candidates: list[dict]) -> dict[str, float]:
 # ============================================================
 # 综合评分系统（满分100分）
 # ============================================================
-def calc_composite_score(vol_ratio: float | None, turnover: float, pct: float, close: float, ma20: float | None) -> int:
+def calc_composite_score(vol_ratio: float | None, turnover: float | None, pct: float, close: float, ma20: float | None) -> int:
     score = 0
 
     # 量比评分（None 表示量比不可用，给中性分）
@@ -469,10 +547,15 @@ def calc_composite_score(vol_ratio: float | None, turnover: float, pct: float, c
     else:
         score += 5
 
-    if 5 <= turnover <= 8:
-        score += 25
-    elif 3 <= turnover <= 10:
-        score += 15
+    # 换手率评分（None 时给中性分）
+    if turnover is not None:
+        if 5 <= turnover <= 8:
+            score += 25
+        elif 3 <= turnover <= 10:
+            score += 15
+    else:
+        score += 10  # 无数据时给中等分
+
     if pct >= 4:
         score += 25
     elif pct >= 3:
@@ -486,7 +569,7 @@ def calc_composite_score(vol_ratio: float | None, turnover: float, pct: float, c
     return min(score, 100)
 
 
-def analyze_main_force_stage(vol_ratio: float | None, pct: float, turnover: float, close: float, ma20: float | None) -> dict:
+def analyze_main_force_stage(vol_ratio: float | None, pct: float, turnover: float | None, close: float, ma20: float | None) -> dict:
     # 放量判断：None 时保守判断为中等活跃
     is_high_volume = (vol_ratio or 0) >= 2.0
     is_active_volume = (vol_ratio or 0) >= 1.5
@@ -512,7 +595,7 @@ def analyze_main_force_stage(vol_ratio: float | None, pct: float, turnover: floa
         stage = "📈 主力建仓"
         detail = "温和放量上涨，主力在悄悄收集筹码"
         confidence = "中"
-    elif not is_active_volume and turnover < 3:
+    elif not is_active_volume and (turnover or 0) < 3:
         stage = "⏸️ 横盘整理"
         detail = "缩量横盘，等待方向选择"
         confidence = "低"
@@ -782,24 +865,30 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     total = len(df)
 
     # ---- 阶段2：粗筛（涨跌幅+换手率+成交额，暂不卡量比） ----
+    # 注意：AlphaFeed备用源时，成交额/换手率可能是NaN，需跳过这些条件
     status_text.text("🔍 正在进行初筛...")
     progress.progress(0.15, text="正在进行初筛...")
+
+    # 检测是否使用AlphaFeed备用源（成交额/换手率大量为NaN）
+    em_count = df["成交额"].notna().sum()
+    use_em_source = em_count > 500  # 东方财富源：有超过500只股票有成交额数据
 
     candidates = []
     for _, row in df.iterrows():
         try:
             symbol = str(row["代码"]).zfill(6)
             name = str(row["名称"])
-            chg = float(row["涨跌幅"])
-            amount = float(row["成交额"])
-            turnover = float(row["换手率"])
-            close = float(row.get("最新价", 0))
+            chg = float(row["涨跌幅"]) if pd.notna(row["涨跌幅"]) else None
+            amount = float(row["成交额"]) if pd.notna(row["成交额"]) else None
+            turnover = float(row["换手率"]) if pd.notna(row["换手率"]) else None
+            close = float(row["最新价"]) if pd.notna(row.get("最新价")) else 0
 
-            if not (config["pct_min"] < chg < config["pct_max"]):
+            if chg is None or not (config["pct_min"] < chg < config["pct_max"]):
                 continue
-            if not (config["turnover_min"] < turnover < config["turnover_max"]):
+            # 仅当数据可用时才筛选
+            if amount is not None and amount < config["amount_min"]:
                 continue
-            if amount < config["amount_min"]:
+            if turnover is not None and not (config["turnover_min"] < turnover < config["turnover_max"]):
                 continue
 
             candidates.append({
@@ -898,9 +987,9 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             "代码": sym,
             "名称": c["name"],
             "涨跌幅%": round(c["chg"], 2),
-            "量比": round(c["vol_ratio"], 2),
-            "换手率%": round(c["turnover"], 2),
-            "成交额亿": round(c["amount"] / 1e8, 2),
+            "量比": round(c["vol_ratio"], 2) if c["vol_ratio"] is not None else "-",
+            "换手率%": round(c["turnover"], 2) if c["turnover"] is not None else "-",
+            "成交额亿": round(c["amount"] / 1e8, 2) if c["amount"] is not None else "-",
             "最新价": round(c["close"], 2),
             "MA20": round(ma20, 2) if ma20 else "-",
             "综合评分": composite_score,
