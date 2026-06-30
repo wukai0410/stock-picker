@@ -1,4 +1,4 @@
-# app.py - 尾盘智能选股工具（完整修复版）
+# app.py - 实时智能选股工具
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
@@ -34,6 +34,12 @@ def is_trading_day() -> bool:
     """判断今天是否为交易日（简单判断：周一至周五）"""
     now = beijing_now()
     return now.weekday() < 5
+
+def _is_market_open() -> bool:
+    """判断当前是否在交易时段（9:30-11:30, 13:00-15:00）"""
+    now = beijing_now()
+    t = now.hour * 60 + now.minute
+    return (570 <= t < 690) or (780 <= t < 900)  # 9:30-11:30, 13:00-15:00
 
 # ============================================================
 # 全局配置
@@ -252,17 +258,8 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     if not is_trading_day():
         st.warning("⚠️ 今日非交易日（周一至周五为交易日），请于交易日运行时再试")
         return None
-    # 判断是否为尾盘时段
-    tail_time = is_tail_time()
-    # 非尾盘时段自动禁用抢筹分析
-    if not tail_time:
-        enable_rush = False
-    # 将实际状态写入 session_state
+    # 抢筹分析状态写入 session_state
     st.session_state["rush_actual_enabled"] = enable_rush
-    st.session_state["rush_auto_disabled"] = not tail_time
-    # 非尾盘提示（在进度条之前显示）
-    if not tail_time:
-        st.info("ℹ️ 当前非尾盘时段（14:30-15:00），抢筹分析已自动跳过。可查看历史数据或手动运行。")
     # 进度条
     status_text = st.empty()
     progress = st.progress(0.0, text="正在初始化...")
@@ -465,43 +462,40 @@ def render_yesterday_review():
 # Streamlit 主页面
 # ============================================================
 st.set_page_config(
-    page_title="尾盘智能选股",
+    page_title="实时智能选股",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-st.title("📈 尾盘智能选股工具")
-st.caption("基于东方财富实时数据 + 尾盘抢筹分析（A股专用）")
+st.title("📈 实时智能选股工具")
+st.caption("基于东方财富实时数据 + 抢筹分析（A股专用）")
 
 # ---- 侧边栏 ----
 with st.sidebar:
     st.header("⚙️ 参数设置")
     now = beijing_now()
-    tail_time = is_tail_time()
     trading_day = is_trading_day()
+    # 交易时段检测
+    is_trading_hours = trading_day and _is_market_open()
     # 时段提示
-    if tail_time and trading_day:
-        st.success("✅ 已进入尾盘时段（14:30-15:00），可启用抢筹分析")
+    if is_trading_hours:
+        st.success("✅ 当前为交易时段，数据实时更新")
     elif trading_day:
-        st.info("ℹ️ 当前为交易时段，但非尾盘时间（尾盘分析将在14:30后可用）")
+        if now.hour < 9 or (now.hour == 9 and now.minute < 30):
+            st.info("ℹ️ 盘前时段，数据为昨日收盘价")
+        elif now.hour >= 15:
+            st.info("ℹ️ 已收盘，数据为今日收盘价")
+        else:
+            st.info("ℹ️ 午间休市（11:30-13:00）")
     else:
         st.warning("⚠️ 今日非交易日，展示历史数据或手动运行")
-    # 抢筹分析开关（非尾盘时段禁用）
+    # 抢筹分析开关（始终可用）
     enable_rush = st.checkbox(
-        "🔍 启用尾盘抢筹分析",
-        value=tail_time and trading_day,
-        disabled=not (tail_time and trading_day),
-        help="仅在尾盘时段（14:30-15:00）可用" if not (tail_time and trading_day) else "分析尾盘抢筹强度"
+        "🔍 启用抢筹分析",
+        value=True,
+        help="分析尾盘抢筹强度（基于近30分钟分时数据）"
     )
-    if not (tail_time and trading_day):
-        st.caption("ℹ️ 抢筹分析已禁用（非尾盘时段）")
-    else:
-        # 显示抢筹实际状态
-        rush_actual = st.session_state.get("rush_actual_enabled", enable_rush)
-        if rush_actual:
-            st.caption("✅ 抢筹分析：已启用")
-        else:
-            st.caption("ℹ️ 抢筹分析：已禁用")
+    st.caption(f"✅ 抢筹分析：{'已启用' if enable_rush else '已禁用'}")
     max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 30, 5)
     st.divider()
     # 运行按钮
@@ -517,7 +511,7 @@ with st.sidebar:
         st.session_state["last_summary"] = None
         st.rerun()
     if st.button("🗑️ 清空历史数据", use_container_width=True):
-        for key in ["history_results", "last_results", "last_results_ts", "last_summary", "rush_auto_disabled"]:
+        for key in ["history_results", "last_results", "last_results_ts", "last_summary"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.success("✅ 历史数据已清空")
@@ -574,7 +568,7 @@ if df_result is not None and not df_result.empty:
     st.download_button(
         label="📥 导出 CSV",
         data=csv_data,
-        file_name=f"尾盘选股_{now.strftime('%Y%m%d_%H%M')}.csv",
+        file_name=f"实时选股_{now.strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
     )
 else:
