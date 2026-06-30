@@ -129,8 +129,8 @@ def fetch_realtime_quotes():
         # 换手率也转百分比
         df["换手率"] = pd.to_numeric(df["turnover_rate"], errors="coerce") * 100
 
-        # 量比：用 1.0 作为默认值（后续在 run_selection 中按需精确计算）
-        df["量比"] = 1.0
+        # 量比：暂用 NaN 占位，后续从东方财富批量获取真实数据
+        df["量比"] = np.nan
 
         df["成交额"] = pd.to_numeric(df["amount"], errors="coerce")
         df["最新价"] = pd.to_numeric(df["last_price"], errors="coerce")
@@ -312,26 +312,66 @@ def get_fund_flow_summary(symbol: str) -> dict:
 
 
 # ============================================================
+# 东方财富批量获取真实量比（按需查询候选股）
+# ============================================================
+def _batch_fetch_vol_ratio(candidates: list[dict]) -> dict[str, float]:
+    """
+    批量获取候选股的量比（东方财富 clist 接口分页）
+    返回 {代码: 量比}，获取失败的代码不在字典中
+    """
+    if not candidates:
+        return {}
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    result = {}
+    # 每次获取500条（东方财富单页上限），按涨幅排序确保候选股尽量在前
+    for page in range(1, 12):  # 最多12页=6000只，覆盖全市场
+        params = {
+            "pn": str(page),
+            "pz": "500",
+            "po": "1",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f3",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f12,f10",
+            "_": str(int(datetime.now().timestamp() * 1000)),
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            data = resp.json()
+            diff_list = (data.get("data") or {}).get("diff") or []
+            for item in diff_list:
+                code = str(item.get("f12", ""))
+                vr = item.get("f10")
+                if code and vr is not None:
+                    try:
+                        result[code] = float(vr) / 100  # 东方财富量比需除以100
+                    except (ValueError, TypeError):
+                        continue
+            # 如果当前页数据量不足500，说明已到末尾
+            if len(diff_list) < 500:
+                break
+        except Exception:
+            break
+    return result
+
+
+# ============================================================
 # 综合评分系统（满分100分）
 # ============================================================
 def calc_composite_score(vol_ratio: float, turnover: float, pct: float, close: float, ma20: float | None) -> int:
     score = 0
 
-    # 量比/换手率评分（量比缺失时用换手率替代）
-    if vol_ratio > 1.0:
-        if vol_ratio >= 2.5:
-            score += 30
-        elif vol_ratio >= 2.0:
-            score += 20
-        else:
-            score += 10
+    # 量比评分
+    if vol_ratio >= 2.5:
+        score += 30
+    elif vol_ratio >= 2.0:
+        score += 20
+    elif vol_ratio >= 1.5:
+        score += 10
     else:
-        if turnover >= 10:
-            score += 30
-        elif turnover >= 8:
-            score += 20
-        elif turnover >= 5:
-            score += 10
+        score += 5
 
     if 5 <= turnover <= 8:
         score += 25
@@ -351,13 +391,9 @@ def calc_composite_score(vol_ratio: float, turnover: float, pct: float, close: f
 
 
 def analyze_main_force_stage(vol_ratio: float, pct: float, turnover: float, close: float, ma20: float | None) -> dict:
-    # 放量判断：优先用真实量比，量比缺失时用换手率替代（>5%视为活跃，>8%视为放量）
-    if vol_ratio > 1.0:
-        is_high_volume = vol_ratio >= 2.0
-        is_active_volume = vol_ratio >= 1.5
-    else:
-        is_high_volume = turnover >= 8
-        is_active_volume = turnover >= 5
+    # 放量判断：直接用真实量比
+    is_high_volume = vol_ratio >= 2.0
+    is_active_volume = vol_ratio >= 1.5
 
     is_high_pct = pct >= 3
     # MA20 缺失时，默认视为站上均线（因为已经通过涨幅筛选，大概率在涨）
@@ -649,9 +685,9 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     config = get_config()
     total = len(df)
 
-    # ---- 阶段2：粗筛（纯内存操作，极快） ----
+    # ---- 阶段2：粗筛（涨跌幅+换手率+成交额，暂不卡量比） ----
     status_text.text("🔍 正在进行初筛...")
-    progress.progress(0.1, text="正在进行初筛...")
+    progress.progress(0.15, text="正在进行初筛...")
 
     candidates = []
     for _, row in df.iterrows():
@@ -659,14 +695,11 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             symbol = str(row["代码"]).zfill(6)
             name = str(row["名称"])
             chg = float(row["涨跌幅"])
-            vol_ratio = float(row["量比"])
             amount = float(row["成交额"])
             turnover = float(row["换手率"])
             close = float(row.get("最新价", 0))
 
             if not (config["pct_min"] < chg < config["pct_max"]):
-                continue
-            if vol_ratio != 1.0 and vol_ratio < config["vol_ratio_min"]:
                 continue
             if not (config["turnover_min"] < turnover < config["turnover_max"]):
                 continue
@@ -675,29 +708,59 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
 
             candidates.append({
                 "symbol": symbol, "name": name, "chg": chg,
-                "vol_ratio": vol_ratio, "amount": amount,
-                "turnover": turnover, "close": close,
+                "amount": amount, "turnover": turnover, "close": close,
             })
         except Exception:
             continue
 
-    status_text.text(f"📊 初筛通过 {len(candidates)} 只，正在深度分析...")
+    status_text.text(f"📊 初筛通过 {len(candidates)} 只，正在获取量比...")
 
     if not candidates:
         progress.progress(1.0, text="✅ 选股完成！")
         st.warning("⚠️ 未找到符合条件的股票")
         return None
 
+    # ---- 阶段2.5：批量获取东方财富真实量比 + 二次筛选 ----
+    progress.progress(0.25, text="正在获取东方财富量比...")
+    vol_map = _batch_fetch_vol_ratio(candidates)
+
+    # 二次筛选：卡量比条件
+    filtered = []
+    skipped_no_vol = 0
+    skipped_low_vol = 0
+    for c in candidates:
+        sym = c["symbol"]
+        vol_ratio = vol_map.get(sym)
+        if vol_ratio is None:
+            skipped_no_vol += 1
+            continue
+        if vol_ratio < config["vol_ratio_min"]:
+            skipped_low_vol += 1
+            continue
+        c["vol_ratio"] = vol_ratio
+        filtered.append(c)
+
+    status_text.text(
+        f"📊 量比筛选：{len(filtered)} 只通过"
+        f"（无数据{skipped_no_vol}只，量比不足{skipped_low_vol}只）"
+    )
+    candidates = filtered
+
+    if not candidates:
+        progress.progress(1.0, text="✅ 选股完成！")
+        st.warning(f"⚠️ 量比筛选后无候选股（初筛{len(filtered) + skipped_no_vol + skipped_low_vol}只均不满足量比条件）")
+        return None
+
     # ---- 阶段3：并行批量获取深度数据 ----
-    progress.progress(0.3, text="正在获取MA20...")
+    progress.progress(0.35, text="正在获取MA20...")
     ma20_map = _batch_fetch_ma20(candidates)
 
-    progress.progress(0.5, text="正在获取资金流向...")
+    progress.progress(0.55, text="正在获取资金流向...")
     fund_map = _batch_fetch_fund_flow(candidates)
 
     rush_map = {}
     if enable_rush:
-        progress.progress(0.7, text="正在分析分时抢筹...")
+        progress.progress(0.75, text="正在分析分时抢筹...")
         rush_map = _batch_fetch_intraday(candidates)
     else:
         rush_map = {c["symbol"]: {"label": "-", "score": 0, "detail": "-"} for c in candidates}
