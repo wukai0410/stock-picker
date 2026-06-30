@@ -1,9 +1,10 @@
-# app.py - 尾盘智能选股工具（AlphaFeed Pro 版 - 并行加速版）
+# app.py - 尾盘智能选股工具（AlphaFeed Pro 版 - 并行加速版 - 完整修复）
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -73,9 +74,9 @@ def get_config():
         "max_stocks": st.session_state.get("cfg_max_stocks", 30),
         "cache_ttl": 600,
         "wecom": {
-            "corpid": "wwab9a5075f240347d",
-            "agentid": "1000002",
-            "secret": "jnwWrisTzy-ni2iFUOpdciihlGfs4DHQyhOqpj1AM_o",
+            "corpid": os.environ.get("WECOM_CORPID", "wwab9a5075f240347d"),
+            "agentid": os.environ.get("WECOM_AGENTID", "1000002"),
+            "secret": os.environ.get("WECOM_SECRET", "jnwWrisTzy-ni2iFUOpdciihlGfs4DHQyhOqpj1AM_o"),
             "touser": "@all",
         }
     }
@@ -128,6 +129,8 @@ def _fetch_eastmoney_market():
             all_rows.extend(diff_list)
             if len(diff_list) < 100:
                 break  # 已到末页
+            # 避免触发限流
+            time.sleep(0.3)
         except Exception:
             break
 
@@ -142,7 +145,7 @@ def _fetch_eastmoney_market():
     result["名称"] = df["f14"].fillna("")
     result["最新价"] = pd.to_numeric(df["f2"], errors="coerce")
     result["涨跌幅"] = pd.to_numeric(df["f3"], errors="coerce")
-    result["量比"] = pd.to_numeric(df["f10"], errors="coerce")
+    result["量比"] = pd.to_numeric(df["f10"], errors="coerce")  # 已经是实际值
     result["换手率"] = pd.to_numeric(df["f8"], errors="coerce")  # 已是百分比
     result["成交额"] = pd.to_numeric(df["f20"], errors="coerce")   # 单位：元
 
@@ -306,14 +309,6 @@ def fetch_a50_change() -> float:
 # ============================================================
 # 资金流向（东方财富逐日资金流向，近10日汇总）
 # ============================================================
-def _get_market_suffix(symbol: str) -> str:
-    """600/601/603/605 -> sh; 000/001/002/003/300/301/688 -> sz"""
-    code = symbol.zfill(6)
-    if code.startswith(('6',)):
-        return 'sh'
-    else:
-        return 'sz'
-
 @st.cache_data(ttl=600)
 def fetch_fund_flow(symbol: str) -> dict:
     """
@@ -329,8 +324,8 @@ def fetch_fund_flow(symbol: str) -> dict:
     }
     try:
         import akshare as ak
-        market = _get_market_suffix(symbol)
-        df = ak.stock_individual_fund_flow(stock=symbol, market=market)
+        # akshare 最新版接口不再需要 market 参数
+        df = ak.stock_individual_fund_flow(stock=symbol)
         if df is None or df.empty:
             return result
 
@@ -338,7 +333,6 @@ def fetch_fund_flow(symbol: str) -> dict:
         recent = df.tail(10).copy()
 
         # 超大单 ≈ 机构，大单 ≈ 大户，小单 ≈ 散户
-        # 主力 = 超大单 + 大单
         # 列名: 超大单净流入-净额, 大单净流入-净额, 小单净流入-净额
         inst_col = "超大单净流入-净额"
         big_col = "大单净流入-净额"
@@ -416,13 +410,12 @@ def _calc_vol_ratio_from_intraday(symbol: str) -> float | None:
         # hist 是 {timestamp:[...], open:[...], close:[...], volume:[...], amount:[...]}
         if isinstance(hist, dict) and "volume" in hist:
             vols = list(hist["volume"])
-            if len(vols) < 4:
+            if len(vols) < 5:
                 return None
-            # 排除今天（第一个或最后一个？AlphaFeed 按时间正序，最后一个是今天）
-            # 取最近5日（排除最后一个）
-            hist_vols = vols[-6:-1]  # 最近6个中的前5个
+            # 排除今天（最后一个），取最近5日
+            hist_vols = vols[-6:-1] if len(vols) >= 6 else vols[:-1]
             if len(hist_vols) < 3:
-                hist_vols = vols[:-1]
+                return None
             avg_daily_vol = sum(hist_vols) / len(hist_vols)
         else:
             return None
@@ -441,7 +434,7 @@ def _calc_vol_ratio_from_intraday(symbol: str) -> float | None:
 
 def _batch_fetch_vol_ratio_eastmoney(candidates: list[dict]) -> dict[str, float]:
     """
-    尝试从东方财富 clist 接口批量获取量比（f10/100）
+    尝试从东方财富 clist 接口批量获取量比（f10）
     如果网络不通，返回空 dict，由调用方 fallback
     """
     url = "https://push2.eastmoney.com/api/qt/clist/get"
@@ -480,12 +473,13 @@ def _batch_fetch_vol_ratio_eastmoney(candidates: list[dict]) -> dict[str, float]
                 vr = item.get("f10")
                 if code and vr is not None:
                     try:
-                        result[code] = float(vr) / 100.0
+                        result[code] = float(vr)  # 东方财富返回的是实际量比值，不需要除以100
                     except (ValueError, TypeError):
                         continue
             # 该页不足500条，说明已到末尾
             if len(diff_list) < 500:
                 break
+            time.sleep(0.3)
         except Exception:
             break
     return result
@@ -786,9 +780,6 @@ def send_wecom_message(df: pd.DataFrame, summary: dict) -> bool:
 
 
 # ============================================================
-# 主选股逻辑
-# ============================================================
-# ============================================================
 # 并行批量数据获取
 # ============================================================
 def _batch_fetch_ma20(candidates: list[dict]) -> dict[str, float | None]:
@@ -869,7 +860,6 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     total = len(df)
 
     # ---- 阶段2：粗筛（涨跌幅+换手率+成交额，暂不卡量比） ----
-    # 注意：AlphaFeed备用源时，成交额/换手率可能是NaN，需跳过这些条件
     status_text.text("🔍 正在进行初筛...")
     progress.progress(0.15, text="正在进行初筛...")
 
@@ -917,6 +907,9 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     if not use_em_source:
         vol_map = {}
         st.info("ℹ️ 当前使用AlphaFeed备用源，跳过量比获取以节省时间")
+    elif not tail_time:
+        vol_map = {}
+        st.info("ℹ️ 非尾盘时段，跳过量比获取")
     else:
         vol_map = _batch_calc_vol_ratios(candidates)
 
@@ -1335,9 +1328,9 @@ def main_page():
     st.title("📈 尾盘智能选股工具")
     st.caption("基于 AlphaFeed Pro 数据源 + 综合评分系统 + 主力分析")
 
-    # AlphaFeed 健康检查（新版SDK无limit参数，用symbols单只股票测试）
+    # AlphaFeed 健康检查
     try:
-        test = af.quotes.get(symbols="600000.SH")
+        test = af.quotes.get(universes="CN_Stock", limit=1)
         if not test:
             st.error("❌ AlphaFeed 连接失败，请检查 API Key 和网络")
             st.stop()
