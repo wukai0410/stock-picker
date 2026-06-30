@@ -1,9 +1,11 @@
 # app.py - 尾盘智能选股工具（完整修复版）
 # -*- coding: utf-8 -*-
 import streamlit as st
-import akshare as ak
 import pandas as pd
 import numpy as np
+import requests
+import json
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import warnings
@@ -50,81 +52,158 @@ def get_config():
     }
 
 # ============================================================
-# 列名兼容工具
+# 东方财富 HTTP API 封装（绕过 akshare WAF 拦截）
 # ============================================================
-def _get_column(df: pd.DataFrame, candidates: list) -> str | None:
-    for col in candidates:
-        if col in df.columns:
-            return col
-    for col in df.columns:
-        for c in candidates:
-            if c in col or col in c:
-                return col
+EASTMONEY_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://quote.eastmoney.com/",
+    "Accept": "*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+}
+
+def _em_fetch(url: str, params: dict, max_retries: int = 3) -> dict | None:
+    """带重试的东方财富 API 请求"""
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, params=params, headers=EASTMONEY_HEADERS, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and data.get("data"):
+                    return data
+            elif resp.status_code == 429:
+                time.sleep(2 * (attempt + 1))
+                continue
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+            continue
     return None
 
-# ============================================================
-# 数据获取（缓存）
-# ============================================================
 @st.cache_data(ttl=600)
 def fetch_realtime_quotes():
-    """获取实时行情数据（带列名兼容性检查）"""
+    """通过东方财富 HTTP API 获取全A股实时行情"""
     try:
-        df = ak.stock_zh_a_spot_em()
-        if df is None or df.empty:
+        # 分页获取全A股行情（每页最多5000只）
+        all_rows = []
+        page = 1
+        while True:
+            url = "https://push2.eastmoney.com/api/qt/clist/get"
+            params = {
+                "pn": page,
+                "pz": 5000,
+                "po": 1,
+                "np": 1,
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fltt": 2,
+                "invt": 2,
+                "fid": "f3",
+                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                "fields": "f2,f3,f4,f5,f6,f7,f8,f10,f12,f14,f15,f16,f17,f18,f20,f21",
+                "_": int(time.time() * 1000),
+            }
+            data = _em_fetch(url, params)
+            if data is None:
+                break
+            diff_list = data["data"].get("diff", [])
+            if not diff_list:
+                break
+            all_rows.extend(diff_list)
+            total = data["data"].get("total", 0)
+            if len(all_rows) >= total:
+                break
+            page += 1
+
+        if not all_rows:
             return None
-        column_mapping = {
-            "代码": ["代码", "code", "股票代码"],
-            "名称": ["名称", "name", "股票名称"],
-            "涨跌幅": ["涨跌幅", "涨跌幅%", "change_pct", "涨幅"],
-            "量比": ["量比", "volume_ratio", "量比(当日)"],
-            "成交额": ["成交额", "amount", "成交金额"],
-            "换手率": ["换手率", "turn_over", "换手率%"],
-            "最新价": ["最新价", "price", "收盘价", "现价"],
-        }
-        mapped_cols = {}
-        for std_name, aliases in column_mapping.items():
-            found = _get_column(df, aliases)
-            if found:
-                mapped_cols[found] = std_name
-        if mapped_cols:
-            df = df.rename(columns=mapped_cols)
-        required_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
-        missing = [c for c in required_cols if c not in df.columns]
-        if missing:
-            st.warning(f"⚠️ 数据源列名不匹配，缺失: {missing}。尝试自动适配...")
-            for col in df.columns:
-                for req in required_cols:
-                    if req in col or col in req:
-                        df = df.rename(columns={col: req})
-                        break
-            missing = [c for c in required_cols if c not in df.columns]
-            if missing:
-                st.error(f"❌ 无法识别必要列: {missing}，请检查 akshare 版本")
-                return None
-        numeric_cols = ["涨跌幅", "量比", "成交额", "换手率", "最新价"]
+
+        # 解析为 DataFrame
+        records = []
+        for item in all_rows:
+            records.append({
+                "代码": str(item.get("f12", "")),
+                "名称": str(item.get("f14", "")),
+                "涨跌幅": item.get("f3", None),
+                "最新价": item.get("f2", None),
+                "量比": item.get("f10", None),
+                "成交额": item.get("f6", None),
+                "换手率": item.get("f8", None),
+                "涨跌额": item.get("f4", None),
+                "最高": item.get("f15", None),
+                "最低": item.get("f16", None),
+                "今开": item.get("f17", None),
+                "昨收": item.get("f18", None),
+                "市盈率": item.get("f20", None),
+                "总市值": item.get("f21", None),
+            })
+
+        df = pd.DataFrame(records)
+
+        # 数值类型转换
+        numeric_cols = ["涨跌幅", "最新价", "量比", "成交额", "换手率", "涨跌额", "最高", "最低", "今开", "昨收", "市盈率", "总市值"]
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # 过滤无效数据
+        df = df.dropna(subset=["代码", "名称", "涨跌幅", "最新价"])
+        df = df[df["代码"].str.match(r"^[0-9]{6}$")]
+        df = df.reset_index(drop=True)
+
         return df
+
     except Exception as e:
         st.error(f"获取实时行情失败: {e}")
         return None
 
 @st.cache_data(ttl=60)
 def fetch_intraday_minute(symbol: str):
-    """获取当日1分钟分时数据（仅保留已知可用接口）"""
+    """通过东方财富 HTTP API 获取当日1分钟分时数据"""
     try:
-        df = ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")
-        if df is None or df.empty:
+        # 判断市场前缀：6开头=上证(1)，0/3开头=深证(0)
+        market = 1 if symbol.startswith("6") else 0
+        secid = f"{market}.{symbol}"
+
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "secid": secid,
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            "klt": "1",        # 1分钟K线
+            "fqt": "1",        # 前复权
+            "end": "20500101",
+            "lmt": "240",      # 最多240根（覆盖全天交易）
+            "_": int(time.time() * 1000),
+        }
+
+        data = _em_fetch(url, params)
+        if data is None:
             return None
-        vol_col = _get_column(df, ["成交量", "volume", "vol", "VOL"])
-        close_col = _get_column(df, ["收盘", "close", "price", "最新价"])
-        if vol_col is None or close_col is None:
+
+        klines = data["data"].get("klines", [])
+        if not klines:
             return None
-        df = df.rename(columns={vol_col: "volume", close_col: "close"})
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+
+        records = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) >= 7:
+                records.append({
+                    "time": parts[0],
+                    "open": float(parts[1]),
+                    "close": float(parts[2]),
+                    "high": float(parts[3]),
+                    "low": float(parts[4]),
+                    "volume": float(parts[5]),
+                    "amount": float(parts[6]),
+                })
+
+        if not records:
+            return None
+
+        df = pd.DataFrame(records)
         return df.dropna(subset=["volume", "close"])
+
     except Exception:
         return None
 
@@ -371,7 +450,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 st.title("📈 尾盘智能选股工具")
-st.caption("基于 akshare 实时数据 + 尾盘抢筹分析（A股专用）")
+st.caption("基于东方财富实时数据 + 尾盘抢筹分析（A股专用）")
 
 # ---- 侧边栏 ----
 with st.sidebar:
@@ -424,7 +503,7 @@ with st.sidebar:
         st.rerun()
     st.divider()
     st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
-    st.caption("数据来源：akshare")
+    st.caption("数据来源：东方财富")
 
 # ---- 主页面 ----
 # 渲染统计摘要
