@@ -512,6 +512,10 @@ def _batch_calc_vol_ratios(candidates: list[dict]) -> dict[str, float]:
         return em_map
 
     # 策略2：对剩余股票，用 AlphaFeed 计算量比
+    # 优化：如果需要fallback太多（>50只），直接放弃，避免长时间卡住
+    if len(needed_codes) > 50:
+        return em_map
+
     result = dict(em_map)  # 先保留东方财富的数据
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {
@@ -907,7 +911,14 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
 
     # ---- 阶段2.5：批量获取/计算量比 + 二次筛选 ----
     progress.progress(0.25, text="正在获取量比数据...")
-    vol_map = _batch_calc_vol_ratios(candidates)
+
+    # 优化：如果已确认使用AlphaFeed备用源（成交额数据大面积缺失），
+    # 直接跳过量比获取，避免逐只请求分时数据的巨大开销
+    if not use_em_source:
+        vol_map = {}
+        st.info("ℹ️ 当前使用AlphaFeed备用源，跳过量比获取以节省时间")
+    else:
+        vol_map = _batch_calc_vol_ratios(candidates)
 
     # 判断量比数据是否有效（成功获取到至少20%候选股的量比）
     vol_success_count = sum(1 for c in candidates if c["symbol"] in vol_map)
