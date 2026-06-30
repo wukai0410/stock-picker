@@ -58,13 +58,22 @@ def get_config():
     }
 
 # ============================================================
-# 东方财富 HTTP API 封装（绕过 akshare WAF 拦截）
+# 数据源：三级回退机制（东方财富 → 新浪 → akshare）
 # ============================================================
+# 当前数据源标识 → 写入 session_state 供 UI 展示
+# 值：eastmoney | sina | akshare | none
+
 EASTMONEY_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://quote.eastmoney.com/",
     "Accept": "*/*",
     "Accept-Language": "zh-CN,zh;q=0.9",
+}
+
+SINA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://finance.sina.com.cn",
+    "Accept": "*/*",
 }
 
 def _em_fetch(url: str, params: dict, max_retries: int = 3) -> dict | None:
@@ -85,11 +94,106 @@ def _em_fetch(url: str, params: dict, max_retries: int = 3) -> dict | None:
             continue
     return None
 
-@st.cache_data(ttl=600)
-def fetch_realtime_quotes():
-    """通过东方财富 HTTP API 获取全A股实时行情"""
+def _sina_fetch_list(max_pages: int = 80) -> list[dict]:
+    """从新浪获取全A股股票列表（分页，每页最多80只，80页覆盖约6400只）"""
+    all_stocks = []
+    for page in range(1, max_pages + 1):
+        try:
+            url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
+            params = {
+                "page": page,
+                "num": 80,
+                "sort": "symbol",
+                "asc": 1,
+                "node": "hs_a",
+                "symbol": "",
+                "_s_r_a": "init",
+            }
+            resp = requests.get(url, params=params, headers=SINA_HEADERS, timeout=15)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            if not data or not isinstance(data, list):
+                break
+            all_stocks.extend(data)
+            if len(data) < 80:
+                break
+        except Exception:
+            break
+    return all_stocks
+
+def _sina_fetch_batch_quotes(codes: list[str]) -> dict[str, dict]:
+    """批量从新浪获取实时行情（每次最多400只）"""
+    result = {}
+    batch_size = 400
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i + batch_size]
+        try:
+            # 构建新浪请求：sh600519,sz000001,...
+            symbols = []
+            for code in batch:
+                prefix = "sh" if code.startswith(("6", "9")) else "sz"
+                symbols.append(f"{prefix}{code}")
+            url = f"https://hq.sinajs.cn/list={','.join(symbols)}"
+            resp = requests.get(url, headers=SINA_HEADERS, timeout=20)
+            if resp.status_code != 200:
+                continue
+            # 解析 JSONP: var hq_str_sh600519="xxx";
+            text = resp.text
+            for line in text.strip().split("\n"):
+                if "=" not in line:
+                    continue
+                # 提取股票代码和值
+                # 格式: var hq_str_sh600519="...";
+                parts = line.split('="', 1)
+                if len(parts) != 2:
+                    continue
+                key_part = parts[0]  # var hq_str_sh600519
+                val_part = parts[1].rstrip('";\n')  # 数据部分
+                code = key_part.replace("var hq_str_", "").replace("sh", "").replace("sz", "")
+                fields = val_part.split(",")
+                if len(fields) < 32:
+                    continue
+                # 新浪字段映射（0-based）:
+                # 0:名称 1:今开 2:昨收 3:最新价 4:最高 5:最低
+                # 8:成交量(手) 9:成交额(元) 30:日期 31:时间
+                # 注意：新浪API没有量比字段！
+                name = fields[0]
+                open_price = float(fields[1]) if fields[1] else None
+                pre_close = float(fields[2]) if fields[2] else None
+                price = float(fields[3]) if fields[3] else None
+                high = float(fields[4]) if fields[4] else None
+                low = float(fields[5]) if fields[5] else None
+                volume = float(fields[8]) if fields[8] else 0
+                amount = float(fields[9]) if fields[9] else 0
+                # 计算涨跌幅
+                if price and pre_close and pre_close > 0:
+                    chg_pct = round((price - pre_close) / pre_close * 100, 2)
+                else:
+                    chg_pct = None
+                # 换手率：新浪批量接口不直接提供，从列表接口补充
+                result[code] = {
+                    "名称": name,
+                    "最新价": price,
+                    "涨跌幅": chg_pct,
+                    "今开": open_price,
+                    "昨收": pre_close,
+                    "最高": high,
+                    "最低": low,
+                    "成交额": amount,
+                    # 以下字段批量接口不提供，由列表接口补充
+                    "量比": None,
+                    "换手率": None,
+                    "市盈率": None,
+                    "总市值": None,
+                }
+        except Exception:
+            continue
+    return result
+
+def _fetch_eastmoney() -> pd.DataFrame | None:
+    """数据源1：东方财富 HTTP API"""
     try:
-        # 分页获取全A股行情（每页最多5000只）
         all_rows = []
         page = 1
         while True:
@@ -122,7 +226,6 @@ def fetch_realtime_quotes():
         if not all_rows:
             return None
 
-        # 解析为 DataFrame
         records = []
         for item in all_rows:
             records.append({
@@ -141,25 +244,159 @@ def fetch_realtime_quotes():
                 "市盈率": item.get("f20", None),
                 "总市值": item.get("f21", None),
             })
-
         df = pd.DataFrame(records)
-
-        # 数值类型转换
-        numeric_cols = ["涨跌幅", "最新价", "量比", "成交额", "换手率", "涨跌额", "最高", "最低", "今开", "昨收", "市盈率", "总市值"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # 过滤无效数据
-        df = df.dropna(subset=["代码", "名称", "涨跌幅", "最新价"])
-        df = df[df["代码"].str.match(r"^[0-9]{6}$")]
-        df = df.reset_index(drop=True)
-
         return df
-
-    except Exception as e:
-        st.error(f"获取实时行情失败: {e}")
+    except Exception:
         return None
+
+def _fetch_sina() -> pd.DataFrame | None:
+    """数据源2：新浪财经（列表+批量行情两步获取）"""
+    try:
+        # 步骤1：获取股票列表（含换手率、市盈率、总市值）
+        stock_list = _sina_fetch_list()
+        if not stock_list:
+            return None
+        # 步骤2：提取代码列表并批量获取行情
+        code_list = [s["code"] for s in stock_list if s.get("code")]
+        quotes = _sina_fetch_batch_quotes(code_list)
+        # 步骤3：合并列表字段 + 行情字段
+        records = []
+        for s in stock_list:
+            code = s.get("code", "")
+            if not code or not code.isdigit() or len(code) != 6:
+                continue
+            q = quotes.get(code, {})
+            # 列表接口提供的字段
+            name = s.get("name", q.get("名称", ""))
+            trade = float(s["trade"]) if s.get("trade") and s["trade"] != "0.000" else q.get("最新价")
+            chg_pct = float(s["changepercent"]) if s.get("changepercent") else q.get("涨跌幅")
+            open_p = float(s["open"]) if s.get("open") else q.get("今开")
+            high = float(s["high"]) if s.get("high") else q.get("最高")
+            low = float(s["low"]) if s.get("low") else q.get("最低")
+            pre_close = float(s["settlement"]) if s.get("settlement") else q.get("昨收")
+            volume = float(s["volume"]) if s.get("volume") else 0
+            amount_val = float(s["amount"]) if s.get("amount") else q.get("成交额", 0)
+            turnover = float(s["turnoverratio"]) if s.get("turnoverratio") else q.get("换手率")
+            pe = float(s["per"]) if s.get("per") else q.get("市盈率")
+            mktcap = float(s["mktcap"]) if s.get("mktcap") else q.get("总市值")
+            # 量比：新浪API不直接提供，留空
+            vol_ratio = None
+            # 如果没有从行情接口拿到价格，用列表接口的
+            if trade is None:
+                trade = float(s["trade"]) if s.get("trade") and s["trade"] != "0.000" else None
+            if chg_pct is None and trade is not None and pre_close is not None and pre_close > 0:
+                chg_pct = round((trade - pre_close) / pre_close * 100, 2)
+            # 涨跌额
+            chg_amount = round(trade - pre_close, 2) if (trade is not None and pre_close is not None) else None
+            records.append({
+                "代码": code,
+                "名称": name,
+                "涨跌幅": chg_pct,
+                "最新价": trade,
+                "量比": vol_ratio,
+                "成交额": amount_val,
+                "换手率": turnover,
+                "涨跌额": chg_amount,
+                "最高": high,
+                "最低": low,
+                "今开": open_p,
+                "昨收": pre_close,
+                "市盈率": pe,
+                "总市值": mktcap,
+            })
+        if not records:
+            return None
+        return pd.DataFrame(records)
+    except Exception:
+        return None
+
+def _fetch_akshare() -> pd.DataFrame | None:
+    """数据源3：akshare 终极回退"""
+    try:
+        import akshare as ak
+        df = ak.stock_zh_a_spot_em()
+        if df is None or df.empty:
+            return None
+        # 列名映射
+        col_map = {
+            "代码": "代码", "名称": "名称", "最新价": "最新价", "涨跌幅": "涨跌幅",
+            "涨跌额": "涨跌额", "成交量": "成交量", "成交额": "成交额",
+            "今开": "今开", "昨收": "昨收", "最高": "最高", "最低": "最低",
+            "换手率": "换手率", "量比": "量比", "市盈率-动态": "市盈率",
+            "总市值": "总市值",
+        }
+        existing = {}
+        for src, dst in col_map.items():
+            if src in df.columns:
+                existing[dst] = df[src]
+        if "代码" not in existing:
+            return None
+        result = pd.DataFrame(existing)
+        return result
+    except Exception:
+        return None
+
+@st.cache_data(ttl=600)
+def fetch_realtime_quotes():
+    """三级回退获取全A股实时行情：东方财富 → 新浪 → akshare"""
+    source_name = "none"
+    df = None
+
+    # ---- 数据源1：东方财富 ----
+    try:
+        df = _fetch_eastmoney()
+        if df is not None and len(df) >= 100:
+            source_name = "eastmoney"
+    except Exception:
+        pass
+
+    # ---- 数据源2：新浪财经 ----
+    if df is None or len(df) < 100:
+        try:
+            df_sina = _fetch_sina()
+            if df_sina is not None and len(df_sina) >= 100:
+                df = df_sina
+                source_name = "sina"
+        except Exception:
+            pass
+
+    # ---- 数据源3：akshare ----
+    if df is None or len(df) < 100:
+        try:
+            df_ak = _fetch_akshare()
+            if df_ak is not None and len(df_ak) >= 100:
+                df = df_ak
+                source_name = "akshare"
+        except Exception:
+            pass
+
+    if df is None or df.empty:
+        st.session_state["data_source"] = "none"
+        return None
+
+    # 数值类型转换
+    numeric_cols = ["涨跌幅", "最新价", "量比", "成交额", "换手率", "涨跌额", "最高", "最低", "今开", "昨收", "市盈率", "总市值"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 过滤无效数据
+    df = df.dropna(subset=["代码", "名称", "涨跌幅", "最新价"])
+    df = df[df["代码"].str.match(r"^[0-9]{6}$")]
+    df = df.reset_index(drop=True)
+
+    # 数据质量诊断 → 写入 session_state 供 UI 展示
+    total_raw = len(df)
+    st.session_state["data_source"] = source_name
+    if total_raw > 0:
+        st.session_state["data_quality"] = {
+            "total": total_raw,
+            "valid_pct": int(df["涨跌幅"].notna().sum()),
+            "valid_vol": int((df["量比"].notna() & (df["量比"] > 0)).sum()),
+            "valid_amount": int((df["成交额"].notna() & (df["成交额"] > 0)).sum()),
+            "valid_turnover": int((df["换手率"].notna() & (df["换手率"] > 0)).sum()),
+        }
+    return df
 
 @st.cache_data(ttl=60)
 def fetch_intraday_minute(symbol: str):
@@ -286,33 +523,42 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
         try:
             symbol = str(row["代码"]).zfill(6)
             name = str(row["名称"])
-            # NaN 检测
-            if pd.isna(row["涨跌幅"]) or pd.isna(row["量比"]) or pd.isna(row["成交额"]) or pd.isna(row["换手率"]):
+            # NaN 检测：涨跌幅和最新价必须有，其他字段根据数据源情况放宽
+            if pd.isna(row["涨跌幅"]) or pd.isna(row["最新价"]):
                 diag["nan_count"] += 1
                 continue
             chg = float(row["涨跌幅"])
-            vol_ratio = float(row["量比"])
-            amount = float(row["成交额"])
-            turnover = float(row["换手率"])
             close = float(row.get("最新价", 0))
+            # 量比/成交额/换手率：允许缺失（数据源可能不提供），缺失时跳过对应筛选条件
+            vol_ratio = float(row["量比"]) if not pd.isna(row.get("量比")) else None
+            amount = float(row["成交额"]) if not pd.isna(row.get("成交额")) else None
+            turnover = float(row["换手率"]) if not pd.isna(row.get("换手率")) else None
+            # 如果核心成交数据全部缺失，标记为NaN
+            if vol_ratio is None and amount is None and turnover is None:
+                diag["nan_count"] += 1
+                continue
             # 筛选条件
             if not (config["pct_min"] < chg < config["pct_max"]):
                 diag["pct_fail"] += 1
                 continue
             diag["pct_pass"] += 1
-            # 量比：收盘后可能为0，非交易时段跳过该条件
-            if _is_market_open() or vol_ratio > 0:
+            # 量比：缺失时跳过，收盘后为0也跳过
+            if vol_ratio is not None and (_is_market_open() or vol_ratio > 0):
                 if vol_ratio < config["vol_ratio_min"]:
                     diag["vol_fail"] += 1
                     continue
             diag["vol_pass"] += 1
-            if not (config["turnover_min"] < turnover < config["turnover_max"]):
-                diag["turnover_fail"] += 1
-                continue
+            # 换手率：缺失时跳过
+            if turnover is not None:
+                if not (config["turnover_min"] < turnover < config["turnover_max"]):
+                    diag["turnover_fail"] += 1
+                    continue
             diag["turnover_pass"] += 1
-            if amount < config["amount_min"]:
-                diag["amount_fail"] += 1
-                continue
+            # 成交额：缺失时跳过
+            if amount is not None:
+                if amount < config["amount_min"]:
+                    diag["amount_fail"] += 1
+                    continue
             diag["amount_pass"] += 1
             # 抢筹分析（如果启用）
             if enable_rush:
@@ -325,13 +571,13 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
                 "代码": symbol,
                 "名称": name,
                 "涨跌幅%": round(chg, 2),
-                "量比": round(vol_ratio, 2),
-                "换手率%": round(turnover, 2),
-                "成交额亿": round(amount / 1e8, 2),
+                "量比": round(vol_ratio, 2) if vol_ratio is not None else None,
+                "换手率%": round(turnover, 2) if turnover is not None else None,
+                "成交额亿": round(amount / 1e8, 2) if amount is not None else None,
                 "最新价": round(close, 2),
                 "抢筹": rush["label"],
                 "抢筹评分": rush["score"],
-                "_sort_key": vol_ratio,
+                "_sort_key": vol_ratio if vol_ratio is not None else 0,
             })
         except Exception:
             errors += 1
@@ -523,9 +769,33 @@ with st.sidebar:
     st.caption("数据来源：东方财富")
 
 def render_filter_funnel():
-    """渲染筛选漏斗可视化"""
+    """渲染筛选漏斗可视化 + 数据源/质量诊断"""
     diag = st.session_state.get("filter_diag")
     total = st.session_state.get("filter_total", 0)
+    data_source = st.session_state.get("data_source", "unknown")
+    data_quality = st.session_state.get("data_quality", {})
+
+    # ---- 数据源标识 ----
+    source_labels = {
+        "eastmoney": ("✅", "东方财富", "green"),
+        "sina": ("⚠️", "新浪财经（量比缺失）", "orange"),
+        "akshare": ("⚠️", "akshare（备用源）", "orange"),
+        "none": ("❌", "无可用数据源", "red"),
+    }
+    label = source_labels.get(data_source, ("❓", data_source, "gray"))
+    st.caption(f"{label[0]} 数据源：**{label[1]}**")
+
+    # ---- 数据质量诊断 ----
+    if data_quality and data_quality.get("total", 0) > 0:
+        dq = data_quality
+        total_stocks = dq["total"]
+        qcols = st.columns(5)
+        qcols[0].metric("总股票数", total_stocks)
+        qcols[1].metric("有效涨跌幅", f"{dq['valid_pct']}", delta=f"{dq['valid_pct']/max(total_stocks,1)*100:.0f}%")
+        qcols[2].metric("有效量比", f"{dq['valid_vol']}", delta=f"{dq['valid_vol']/max(total_stocks,1)*100:.0f}%")
+        qcols[3].metric("有效成交额", f"{dq['valid_amount']}", delta=f"{dq['valid_amount']/max(total_stocks,1)*100:.0f}%")
+        qcols[4].metric("有效换手率", f"{dq['valid_turnover']}", delta=f"{dq['valid_turnover']/max(total_stocks,1)*100:.0f}%")
+
     if diag is None or total == 0:
         return
     st.subheader("🔍 筛选漏斗分析")
