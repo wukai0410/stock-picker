@@ -784,7 +784,8 @@ def run_tail_selection(cfg: dict, max_stocks: int) -> pd.DataFrame | None:
     progress = st.progress(0.0, text="🕐 尾盘选股分析中...")
     status_text = st.empty()
     results = []
-    kline_cache: dict[str, dict] = {}
+    kline_cache: dict[str, dict] = {}      # {symbol: mas_dict} 均线指标缓存
+    kline_raw_cache: dict[str, list] = {}   # {symbol: [klines]} 原始K线缓存（用于量比计算）
     diag = {
         "total": total,
         "pct_fail": 0, "vol_fail": 0, "turnover_fail": 0,
@@ -805,7 +806,18 @@ def run_tail_selection(cfg: dict, max_stocks: int) -> pd.DataFrame | None:
 
             chg = float(row["涨跌幅"])
             price = float(row["最新价"])
-            vol_ratio = float(row["量比"]) if pd.notna(row.get("量比")) else None
+            vol_ratio_raw = row.get("量比")
+            vol_ratio = float(vol_ratio_raw) if pd.notna(vol_ratio_raw) else None
+            # 量比为空时，尝试从K线数据计算（新浪数据源无量比字段）
+            if vol_ratio is None:
+                if symbol not in kline_raw_cache:
+                    kline_raw_cache[symbol] = fetch_daily_kline(symbol, days=30)
+                klines_30 = kline_raw_cache.get(symbol)
+                if klines_30 and len(klines_30) >= 6:
+                    vols = [k["volume"] for k in klines_30]
+                    vol_5d_avg = sum(vols[-6:-1]) / 5
+                    if vol_5d_avg > 0:
+                        vol_ratio = round(vols[-1] / vol_5d_avg, 2)
             turnover = float(row["换手率"]) if pd.notna(row.get("换手率")) else None
             amount = float(row["成交额"]) if pd.notna(row.get("成交额")) else None
             mktcap = float(row["总市值"]) if pd.notna(row.get("总市值")) else None
