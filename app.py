@@ -300,9 +300,11 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
                 diag["pct_fail"] += 1
                 continue
             diag["pct_pass"] += 1
-            if vol_ratio < config["vol_ratio_min"]:
-                diag["vol_fail"] += 1
-                continue
+            # 量比：收盘后可能为0，非交易时段跳过该条件
+            if _is_market_open() or vol_ratio > 0:
+                if vol_ratio < config["vol_ratio_min"]:
+                    diag["vol_fail"] += 1
+                    continue
             diag["vol_pass"] += 1
             if not (config["turnover_min"] < turnover < config["turnover_max"]):
                 diag["turnover_fail"] += 1
@@ -336,16 +338,16 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             continue
     progress.progress(1.0, text="✅ 选股完成！")
     status_text.text(f"✅ 选股完成！共找到 {len(results)} 只候选股")
+    # 筛选漏斗诊断 → 无论结果是否为空都要写入 session_state
+    st.session_state["filter_diag"] = diag
+    st.session_state["filter_total"] = total
     if not results:
-        st.warning("⚠️ 未找到符合条件的股票，请调整筛选条件或稍后重试")
+        st.warning("⚠️ 未找到符合条件的股票，请调整筛选条件或稍后重试（查看下方漏斗图定位瓶颈）")
         return None
     # 按量比排序
     results.sort(key=lambda x: x["_sort_key"], reverse=True)
     df_result = pd.DataFrame(results[:max_stocks])
     df_result = df_result.drop(columns=["_sort_key"])
-    # 筛选漏斗诊断 → 存入 session_state 供 UI 展示
-    st.session_state["filter_diag"] = diag
-    st.session_state["filter_total"] = total
     # 统计摘要
     summary = {
         "total_stocks": total,
