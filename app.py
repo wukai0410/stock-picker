@@ -276,6 +276,12 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     results = []
     rush_cache = {}
     errors = 0
+    # 筛选漏斗诊断
+    diag = {
+        "pct_pass": 0, "vol_pass": 0, "turnover_pass": 0, "amount_pass": 0,
+        "pct_fail": 0, "vol_fail": 0, "turnover_fail": 0, "amount_fail": 0,
+        "nan_count": 0,
+    }
     for i, (idx, row) in enumerate(df.iterrows()):
         if i % 10 == 0:
             progress.progress((i + 1) / total, text=f"⏳ 正在分析 {i+1}/{total} ...")
@@ -283,6 +289,10 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
         try:
             symbol = str(row["代码"]).zfill(6)
             name = str(row["名称"])
+            # NaN 检测
+            if pd.isna(row["涨跌幅"]) or pd.isna(row["量比"]) or pd.isna(row["成交额"]) or pd.isna(row["换手率"]):
+                diag["nan_count"] += 1
+                continue
             chg = float(row["涨跌幅"])
             vol_ratio = float(row["量比"])
             amount = float(row["成交额"])
@@ -290,13 +300,21 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             close = float(row.get("最新价", 0))
             # 筛选条件
             if not (config["pct_min"] < chg < config["pct_max"]):
+                diag["pct_fail"] += 1
                 continue
+            diag["pct_pass"] += 1
             if vol_ratio < config["vol_ratio_min"]:
+                diag["vol_fail"] += 1
                 continue
+            diag["vol_pass"] += 1
             if not (config["turnover_min"] < turnover < config["turnover_max"]):
+                diag["turnover_fail"] += 1
                 continue
+            diag["turnover_pass"] += 1
             if amount < config["amount_min"]:
+                diag["amount_fail"] += 1
                 continue
+            diag["amount_pass"] += 1
             # 抢筹分析（如果启用）
             if enable_rush:
                 if symbol not in rush_cache:
@@ -328,6 +346,9 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     results.sort(key=lambda x: x["_sort_key"], reverse=True)
     df_result = pd.DataFrame(results[:max_stocks])
     df_result = df_result.drop(columns=["_sort_key"])
+    # 筛选漏斗诊断 → 存入 session_state 供 UI 展示
+    st.session_state["filter_diag"] = diag
+    st.session_state["filter_total"] = total
     # 统计摘要
     summary = {
         "total_stocks": total,
@@ -505,9 +526,38 @@ with st.sidebar:
     st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
     st.caption("数据来源：东方财富")
 
+def render_filter_funnel():
+    """渲染筛选漏斗可视化"""
+    diag = st.session_state.get("filter_diag")
+    total = st.session_state.get("filter_total", 0)
+    if diag is None or total == 0:
+        return
+    st.subheader("🔍 筛选漏斗分析")
+    stages = [
+        ("总股票数", total, total, "blue"),
+        ("NaN 异常", diag["nan_count"], total - diag["nan_count"], "gray"),
+        ("涨幅 2%~7%", diag["pct_fail"], diag["pct_pass"], "green"),
+        ("量比 >=1.2", diag["vol_fail"], diag["vol_pass"], "orange"),
+        ("换手率 3%~15%", diag["turnover_fail"], diag["turnover_pass"], "purple"),
+        ("成交额 >=1亿", diag["amount_fail"], diag["amount_pass"], "red"),
+    ]
+    cols = st.columns(len(stages))
+    for i, (label, fail, pass_cnt, color) in enumerate(stages):
+        with cols[i]:
+            st.metric(label, pass_cnt if i > 0 else total,
+                     delta=f"-{fail}" if i > 0 and fail > 0 else None,
+                     delta_color="inverse")
+    # 漏斗进度条
+    total_n = total if total > 0 else 1
+    for label, fail, pass_cnt, color in stages[1:]:
+        pct = pass_cnt / total_n * 100
+        st.progress(pct / 100, text=f"{label} → {pass_cnt} 只 ({pct:.1f}%)")
+
 # ---- 主页面 ----
 # 渲染统计摘要
 render_summary_panel()
+# 渲染筛选漏斗
+render_filter_funnel()
 # 加载并显示最近结果
 df_result, cached_ts = load_last_results()
 if df_result is not None and not df_result.empty:
