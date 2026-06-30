@@ -346,7 +346,12 @@ def fetch_realtime_quotes():
     try:
         df = _fetch_eastmoney()
         if df is not None and len(df) >= 100:
-            source_name = "eastmoney"
+            # 质量校验：涨跌幅有效比例必须 > 50%，否则视为脏数据
+            valid_pct = df["涨跌幅"].notna().sum() if "涨跌幅" in df.columns else 0
+            if valid_pct / len(df) > 0.5:
+                source_name = "eastmoney"
+            else:
+                df = None  # 数据质量不达标，丢弃并回退
     except Exception:
         pass
 
