@@ -680,6 +680,25 @@ def run_selection(enable_rush=True, max_stocks=30):
         return None
 
     config = get_config()
+    # 根据时段动态放宽筛选条件
+    hour = now.hour
+    is_tail = (hour == 14 and now.minute >= 30) or (hour == 15)
+    if not is_tail:
+        # 非尾盘时段：放宽条件确保有结果
+        pct_min = max(0.5, config["pct_min"] * 0.3)      # 0.6%
+        pct_max = config["pct_max"] * 2                    # 14%
+        vol_ratio_min = config["vol_ratio_min"] * 0.6      # 0.72
+        turnover_min = config["turnover_min"] * 0.4         # 1.2%
+        turnover_max = config["turnover_max"] * 1.5         # 22.5%
+        amount_min = config["amount_min"] * 0.3             # 3000万
+    else:
+        pct_min = config["pct_min"]
+        pct_max = config["pct_max"]
+        vol_ratio_min = config["vol_ratio_min"]
+        turnover_min = config["turnover_min"]
+        turnover_max = config["turnover_max"]
+        amount_min = config["amount_min"]
+
     total = len(df)
     results = []
     rush_cache = {}
@@ -699,13 +718,13 @@ def run_selection(enable_rush=True, max_stocks=30):
             turnover    = float(row["换手率"])
             close       = float(row.get("最新价", 0))
 
-            if not (config["pct_min"] < chg < config["pct_max"]):
+            if not (pct_min < chg < pct_max):
                 continue
-            if vol_ratio < config["vol_ratio_min"]:
+            if vol_ratio < vol_ratio_min:
                 continue
-            if not (config["turnover_min"] < turnover < config["turnover_max"]):
+            if not (turnover_min < turnover < turnover_max):
                 continue
-            if amount < config["amount_min"]:
+            if amount < amount_min:
                 continue
 
             ma20 = fetch_ma20(symbol)
@@ -1057,9 +1076,13 @@ def main_page():
         st.header("⚙️ 参数设置")
         now = beijing_now()
         trading_day = is_trading_day()
+        is_tail = (now.hour == 14 and now.minute >= 30) or (now.hour == 15)
 
         if trading_day:
-            st.success("✅ 交易日 - 选股工具已就绪")
+            if is_tail:
+                st.success("✅ 尾盘时段（14:30-15:00）— 严格筛选模式")
+            else:
+                st.info("ℹ️ 非尾盘时段 — 已自动放宽筛选条件")
         else:
             st.warning("⚠️ 今日非交易日")
 
