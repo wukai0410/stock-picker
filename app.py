@@ -62,8 +62,8 @@ def get_config():
         "pct_min": 2.0,
         "pct_max": 7.0,
         "vol_ratio_min": 1.2,
-        "turn_over_min": 3.0,
-        "turn_over_max": 15.0,
+        "turnover_min": 3.0,
+        "turnover_max": 15.0,
         "amount_min": 1e8,
         "max_stocks": 30,
         "cache_ttl": 600,
@@ -129,8 +129,9 @@ def fetch_realtime_quotes():
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+                # AlphaFeed 无量比字段，用1.5作为默认值（中性）
                 if "量比" not in df.columns:
-                    df["量比"] = None
+                    df["量比"] = 1.5
 
                 return df[["代码", "名称", "涨跌幅", "量比",
                              "成交额", "换手率", "最新价"]]
