@@ -312,19 +312,72 @@ def get_fund_flow_summary(symbol: str) -> dict:
 
 
 # ============================================================
-# 东方财富批量获取真实量比（按需查询候选股）
+# 量比获取（AlphaFeed 计算 + 东方财富备用）
 # ============================================================
-def _batch_fetch_vol_ratio(candidates: list[dict]) -> dict[str, float]:
+def _calc_vol_ratio_from_intraday(symbol: str) -> float | None:
     """
-    批量获取候选股的量比（东方财富 clist 接口分页）
-    返回 {代码: 量比}，获取失败的代码不在字典中
+    通过 AlphaFeed 分时数据计算量比：
+    量比 = 今日累计成交量 / 过去5日同期平均累计成交量
+    通常在尾盘14:30后调用，取全天数据
     """
-    if not candidates:
-        return {}
+    try:
+        af_symbol = to_alphafeed_symbol(symbol)
+        # 获取今日1分钟数据（period='1m'）
+        today_data = af.klines.get(af_symbol, period="1m", count=300, adjust="none")
+        if not today_data or not isinstance(today_data, dict):
+            return None
+        today_volumes = today_data.get("volume", [])
+        if not today_volumes or len(today_volumes) < 30:
+            return None
+        today_total = sum(today_volumes)
+
+        # 获取过去5日的日线数据
+        hist = af.klines.get(af_symbol, period="1d", count=10, adjust="forward")
+        if not hist:
+            return None
+        # hist 是 {timestamp:[...], open:[...], close:[...], volume:[...], amount:[...]}
+        if isinstance(hist, dict) and "volume" in hist:
+            vols = list(hist["volume"])
+            if len(vols) < 4:
+                return None
+            # 排除今天（第一个或最后一个？AlphaFeed 按时间正序，最后一个是今天）
+            # 取最近5日（排除最后一个）
+            hist_vols = vols[-6:-1]  # 最近6个中的前5个
+            if len(hist_vols) < 3:
+                hist_vols = vols[:-1]
+            avg_daily_vol = sum(hist_vols) / len(hist_vols)
+        else:
+            return None
+
+        # A股约240分钟/天；今日已交易分钟数
+        minutes_today = len(today_volumes)
+        expected_vol = avg_daily_vol * (minutes_today / 240.0)
+
+        if expected_vol <= 0:
+            return None
+        vol_ratio = today_total / expected_vol
+        return round(vol_ratio, 2)
+    except Exception:
+        return None
+
+
+def _batch_fetch_vol_ratio_eastmoney(candidates: list[dict]) -> dict[str, float]:
+    """
+    尝试从东方财富 clist 接口批量获取量比（f10/100）
+    如果网络不通，返回空 dict，由调用方 fallback
+    """
     url = "https://push2.eastmoney.com/api/qt/clist/get"
     result = {}
-    # 每次获取500条（东方财富单页上限），按涨幅排序确保候选股尽量在前
-    for page in range(1, 12):  # 最多12页=6000只，覆盖全市场
+    # 使用 Session + 浏览器 Headers，避免被反爬断开
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://quote.eastmoney.com/",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    })
+    # 最多拉12页（约6000只，覆盖全市场）
+    for page in range(1, 13):
         params = {
             "pn": str(page),
             "pz": "500",
@@ -338,18 +391,21 @@ def _batch_fetch_vol_ratio(candidates: list[dict]) -> dict[str, float]:
             "_": str(int(datetime.now().timestamp() * 1000)),
         }
         try:
-            resp = requests.get(url, params=params, timeout=10)
+            resp = session.get(url, params=params, timeout=10)
+            resp.raise_for_status()
             data = resp.json()
             diff_list = (data.get("data") or {}).get("diff") or []
+            if not diff_list:
+                break
             for item in diff_list:
                 code = str(item.get("f12", ""))
                 vr = item.get("f10")
                 if code and vr is not None:
                     try:
-                        result[code] = float(vr) / 100  # 东方财富量比需除以100
+                        result[code] = float(vr) / 100.0
                     except (ValueError, TypeError):
                         continue
-            # 如果当前页数据量不足500，说明已到末尾
+            # 该页不足500条，说明已到末尾
             if len(diff_list) < 500:
                 break
         except Exception:
@@ -357,14 +413,54 @@ def _batch_fetch_vol_ratio(candidates: list[dict]) -> dict[str, float]:
     return result
 
 
+def _batch_calc_vol_ratios(candidates: list[dict]) -> dict[str, float]:
+    """
+    为候选股批量计算量比：
+    1. 先尝试东方财富批量接口（快，1次请求拿全市场）
+    2. 获取失败的，回退到 AlphaFeed 逐只计算（慢，但可靠）
+    返回 {代码: 量比}
+    """
+    if not candidates:
+        return {}
+
+    # 策略1：东方财富批量接口
+    em_map = _batch_fetch_vol_ratio_eastmoney(candidates)
+    em_codes = set(em_map.keys())
+    needed_codes = [c for c in candidates if c["symbol"] not in em_codes]
+    success_count = len(em_codes & set(c["symbol"] for c in candidates))
+
+    if success_count >= len(candidates) * 0.8:
+        # 80%以上命中，直接返回
+        return em_map
+
+    # 策略2：对剩余股票，用 AlphaFeed 计算量比
+    result = dict(em_map)  # 先保留东方财富的数据
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(_calc_vol_ratio_from_intraday, c["symbol"]): c["symbol"]
+            for c in needed_codes
+        }
+        for f in as_completed(futures):
+            sym = futures[f]
+            try:
+                vr = f.result()
+                if vr is not None and vr > 0:
+                    result[sym] = vr
+            except Exception:
+                pass
+    return result
+
+
 # ============================================================
 # 综合评分系统（满分100分）
 # ============================================================
-def calc_composite_score(vol_ratio: float, turnover: float, pct: float, close: float, ma20: float | None) -> int:
+def calc_composite_score(vol_ratio: float | None, turnover: float, pct: float, close: float, ma20: float | None) -> int:
     score = 0
 
-    # 量比评分
-    if vol_ratio >= 2.5:
+    # 量比评分（None 表示量比不可用，给中性分）
+    if vol_ratio is None:
+        score += 10  # 中性分，不惩罚也不奖励
+    elif vol_ratio >= 2.5:
         score += 30
     elif vol_ratio >= 2.0:
         score += 20
@@ -390,10 +486,10 @@ def calc_composite_score(vol_ratio: float, turnover: float, pct: float, close: f
     return min(score, 100)
 
 
-def analyze_main_force_stage(vol_ratio: float, pct: float, turnover: float, close: float, ma20: float | None) -> dict:
-    # 放量判断：直接用真实量比
-    is_high_volume = vol_ratio >= 2.0
-    is_active_volume = vol_ratio >= 1.5
+def analyze_main_force_stage(vol_ratio: float | None, pct: float, turnover: float, close: float, ma20: float | None) -> dict:
+    # 放量判断：None 时保守判断为中等活跃
+    is_high_volume = (vol_ratio or 0) >= 2.0
+    is_active_volume = (vol_ratio or 0) >= 1.5
 
     is_high_pct = pct >= 3
     # MA20 缺失时，默认视为站上均线（因为已经通过涨幅筛选，大概率在涨）
@@ -720,35 +816,54 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
         st.warning("⚠️ 未找到符合条件的股票")
         return None
 
-    # ---- 阶段2.5：批量获取东方财富真实量比 + 二次筛选 ----
-    progress.progress(0.25, text="正在获取东方财富量比...")
-    vol_map = _batch_fetch_vol_ratio(candidates)
+    # ---- 阶段2.5：批量获取/计算量比 + 二次筛选 ----
+    progress.progress(0.25, text="正在获取量比数据...")
+    vol_map = _batch_calc_vol_ratios(candidates)
 
-    # 二次筛选：卡量比条件
-    filtered = []
-    skipped_no_vol = 0
-    skipped_low_vol = 0
-    for c in candidates:
-        sym = c["symbol"]
-        vol_ratio = vol_map.get(sym)
-        if vol_ratio is None:
-            skipped_no_vol += 1
-            continue
-        if vol_ratio < config["vol_ratio_min"]:
-            skipped_low_vol += 1
-            continue
-        c["vol_ratio"] = vol_ratio
-        filtered.append(c)
+    # 判断量比数据是否有效（成功获取到至少20%候选股的量比）
+    vol_success_count = sum(1 for c in candidates if c["symbol"] in vol_map)
+    vol_data_valid = vol_success_count >= len(candidates) * 0.2
 
-    status_text.text(
-        f"📊 量比筛选：{len(filtered)} 只通过"
-        f"（无数据{skipped_no_vol}只，量比不足{skipped_low_vol}只）"
-    )
-    candidates = filtered
+    if not vol_data_valid:
+        # 量比数据大面积不可用（非交易时间/网络问题）→ 跳过量比筛选，全部放行
+        for c in candidates:
+            c["vol_ratio"] = None
+            c["_vol_missing"] = True
+        status_text.text(
+            f"📊 量比数据不可用（{vol_success_count}/{len(candidates)}只），"
+            f"跳过量比筛选，{len(candidates)} 只全部放行"
+        )
+    else:
+        # 量比数据可用 → 正常筛选
+        filtered = []
+        skipped_low_vol = 0
+        auto_passed = 0
+        for c in candidates:
+            sym = c["symbol"]
+            vol_ratio = vol_map.get(sym)
+            if vol_ratio is None:
+                # 个别股票量比缺失，放行
+                c["vol_ratio"] = None
+                c["_vol_missing"] = True
+                auto_passed += 1
+                filtered.append(c)
+                continue
+            if vol_ratio < config["vol_ratio_min"]:
+                skipped_low_vol += 1
+                continue
+            c["vol_ratio"] = vol_ratio
+            c["_vol_missing"] = False
+            filtered.append(c)
+
+        status_text.text(
+            f"📊 量比筛选：{len(filtered)} 只通过"
+            f"（无数据{auto_passed}只放行，量比不足{skipped_low_vol}只剔除）"
+        )
+        candidates = filtered
 
     if not candidates:
         progress.progress(1.0, text="✅ 选股完成！")
-        st.warning(f"⚠️ 量比筛选后无候选股（初筛{len(filtered) + skipped_no_vol + skipped_low_vol}只均不满足量比条件）")
+        st.warning("⚠️ 筛选后无候选股")
         return None
 
     # ---- 阶段3：并行批量获取深度数据 ----
