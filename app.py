@@ -82,90 +82,94 @@ _EM_FIELD_MAP = {
     "f23": "市净率", "f62": "主力净流入",
 }
 
-def _fetch_em_spot_fallback() -> pd.DataFrame | None:
-    """兜底方案：自己逐页请求东方财富API，每页独立重试，失败页跳过"""
-    import time, random
-    url = "https://82.push2.eastmoney.com/api/qt/clist/get"
-    fields = "f2,f3,f4,f5,f6,f7,f8,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62"
-    base_params = {
-        "pn": "1", "pz": "100", "po": "1", "np": "1",
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        "fltt": "2", "invt": "2", "fid": "f3",
-        "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
-        "fields": fields,
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://quote.eastmoney.com/",
-    }
-
-    # 第1页：获取总数
-    for retry in range(3):
-        try:
-            r = requests.get(url, params=base_params, timeout=20, headers=headers)
-            data = r.json()
-            total = data["data"]["total"]
-            all_items = list(data["data"]["diff"])
-            break
-        except Exception:
-            if retry < 2:
-                time.sleep(2 * (retry + 1))
-            else:
-                return None
-
-    per_page = len(all_items)  # 通常是100
-    total_pages = (total + per_page - 1) // per_page
-    failed_pages = 0
-
-    # 逐页请求，每页独立重试
-    for page in range(2, total_pages + 1):
-        params = {**base_params, "pn": str(page)}
-        page_ok = False
-        for retry in range(3):
-            try:
-                time.sleep(random.uniform(0.3, 0.8))
-                r = requests.get(url, params=params, timeout=15, headers=headers)
-                items = r.json()["data"]["diff"]
-                all_items.extend(items)
-                page_ok = True
-                break
-            except Exception:
-                if retry < 2:
-                    time.sleep(1.5 * (retry + 1))
-        if not page_ok:
-            failed_pages += 1
-            if failed_pages > 5:
-                # 超过5页失败则放弃
-                break
-
-    if not all_items:
-        return None
-
-    df = pd.DataFrame(all_items)
-    # 重命名列
-    rename_map = {k: v for k, v in _EM_FIELD_MAP.items() if k in df.columns}
-    df = df.rename(columns=rename_map)
-
-    # 只保留需要的列
-    keep_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
-    for c in keep_cols:
-        if c not in df.columns:
-            df[c] = None
-    df = df[keep_cols]
-
-    # 数值转换
-    for col in ["涨跌幅", "量比", "成交额", "换手率", "最新价"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df
-
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_realtime_quotes():
-    import time
-    last_err = None
+    """
+    获取全市场A股实时行情。
+    优先用自写函数（pz=500，拉全量），akshare 作为备用。
+    """
+    import time, random
 
-    # 方案A：akshare 标准接口
+    # 优先：自写全量拉取（每页100条，约59页，全市场~5900只）
+    def _fetch_all_em():
+        url = "https://82.push2.eastmoney.com/api/qt/clist/get"
+        fields = (
+            "f2,f3,f4,f5,f6,f7,f8,f10,f12,f14,"
+            "f15,f16,f17,f18,f20,f21,f23,f62"
+        )
+        # 注意：东方财富API忽略 pz>100 的参数，强制每页100条
+        base_params = {
+            "pn": "1", "pz": "100", "po": "1", "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2", "invt": "2", "fid": "f3",
+            "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+            "fields": fields,
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+
+        # 第1页：获取总数
+        for retry in range(3):
+            try:
+                r = requests.get(url, params=base_params, timeout=20, headers=headers)
+                data = r.json()
+                total = data["data"]["total"]
+                all_items = list(data["data"]["diff"])
+                break
+            except Exception:
+                if retry < 2:
+                    time.sleep(2 * (retry + 1))
+                else:
+                    return None
+
+        per_page = len(all_items)  # 实际是100
+        total_pages = (total + per_page - 1) // per_page  # 约59页
+
+        # 逐页请求；单页失败只跳过，不中断
+        for page in range(2, total_pages + 1):
+            params = {**base_params, "pn": str(page)}
+            for retry in range(3):
+                try:
+                    time.sleep(random.uniform(0.1, 0.3))
+                    r = requests.get(url, params=params, timeout=15, headers=headers)
+                    items = r.json()["data"]["diff"]
+                    all_items.extend(items)
+                    break
+                except Exception:
+                    if retry < 2:
+                        time.sleep(0.8 * (retry + 1))
+            # 不检查 page_ok，失败页自动跳过
+
+        if not all_items:
+            return None
+
+        df = pd.DataFrame(all_items)
+        rename_map = {k: v for k, v in _EM_FIELD_MAP.items() if k in df.columns}
+        df = df.rename(columns=rename_map)
+
+        keep_cols = ["代码", "名称", "涨跌幅", "量比", "成交额", "换手率", "最新价"]
+        for c in keep_cols:
+            if c not in df.columns:
+                df[c] = None
+        df = df[keep_cols]
+
+        for col in ["涨跌幅", "量比", "成交额", "换手率", "最新价"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        return df
+
+    # 方案A：自写全量拉取
+    try:
+        df = _fetch_all_em()
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+
+    # 方案B：akshare 标准接口（备用）
     for attempt in range(2):
         try:
             df = ak.stock_zh_a_spot_em()
@@ -204,19 +208,9 @@ def fetch_realtime_quotes():
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             return df
-        except Exception as e:
-            last_err = e
+        except Exception:
             if attempt < 1:
                 time.sleep(2)
-
-    # 方案B：兜底——自己逐页请求，容错更强
-    st.warning(f"⚠️ akshare 标准接口失败，尝试兜底方案...")
-    try:
-        df = _fetch_em_spot_fallback()
-        if df is not None and not df.empty:
-            return df
-    except Exception as e:
-        last_err = e
 
     return None
 
