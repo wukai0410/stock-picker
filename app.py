@@ -291,7 +291,7 @@ def fetch_realtime_quotes():
     df = df[df["代码"].str.match(r"^[0-9]{6}$")]
     df = df.reset_index(drop=True)
 
-    # 数据质量诊断
+    # 数据质量诊断（量比补全后重新统计）
     total_raw = len(df)
     st.session_state["data_source"] = source_name
     st.session_state["data_quality"] = {
@@ -302,14 +302,22 @@ def fetch_realtime_quotes():
         "valid_turnover": int(df["换手率"].notna().sum()),
     }
 
-    # 量比补全：新浪数据源不返回量比字段，从K线数据计算（当日量/5日均量）
+    # 量比补全：新浪数据源不返回量比字段，从新浪K线数据计算（当日量/5日均量）
     vol_na_mask = df["量比"].isna()
     if vol_na_mask.any():
         _vol_fill_count = 0
+        _vol_fill_max = 200  # 最多补全200只，避免耗时过长（每只约0.2s）
+        # 先尝试东方财富K线（更快），失败后回退到新浪K线
         for idx in df[vol_na_mask].index:
+            if _vol_fill_count >= _vol_fill_max:
+                break
             try:
                 sym = str(df.loc[idx, "代码"]).zfill(6)
+                # 尝试东方财富K线
                 klines = fetch_daily_kline(sym, days=30)
+                # 如果东方财富失败（收盘后可能不可用），回退到新浪K线
+                if not klines or len(klines) < 6:
+                    klines = _fetch_sina_kline(sym, days=30)
                 if klines and len(klines) >= 6:
                     vols = [k["volume"] for k in klines]
                     avg_5d = sum(vols[-6:-1]) / 5
@@ -353,6 +361,38 @@ def fetch_daily_kline(symbol: str, days: int = 120) -> list[dict]:
                     "high": float(parts[3]), "low": float(parts[4]),
                     "volume": float(parts[5]), "amount": float(parts[6]),
                 })
+        return result
+    except Exception:
+        return []
+
+@st.cache_data(ttl=3600)
+def _fetch_sina_kline(symbol: str, days: int = 30) -> list[dict]:
+    """获取日K线数据（新浪财经），返回 [{date, open, close, high, low, volume}, ...]
+    收盘后仍可用，作为东方财富K线不可用时的回退方案"""
+    try:
+        prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
+        url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+        params = {"symbol": f"{prefix}{symbol}", "scale": 240, "ma": "no", "datalen": days}
+        resp = requests.get(url, params=params, headers=SINA_HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        if not data or not isinstance(data, list):
+            return []
+        result = []
+        for item in data:
+            try:
+                result.append({
+                    "date": item.get("day", ""),
+                    "open": float(item.get("open", 0)),
+                    "close": float(item.get("close", 0)),
+                    "high": float(item.get("high", 0)),
+                    "low": float(item.get("low", 0)),
+                    "volume": float(item.get("volume", 0)),
+                    "amount": 0,
+                })
+            except Exception:
+                continue
         return result
     except Exception:
         return []
@@ -830,7 +870,11 @@ def run_tail_selection(cfg: dict, max_stocks: int) -> pd.DataFrame | None:
             # 量比为空时，尝试从K线数据计算（新浪数据源无量比字段）
             if vol_ratio is None:
                 if symbol not in kline_raw_cache:
-                    kline_raw_cache[symbol] = fetch_daily_kline(symbol, days=30)
+                    klines_30 = fetch_daily_kline(symbol, days=30)
+                    # 东方财富K线失败时回退到新浪K线
+                    if not klines_30 or len(klines_30) < 6:
+                        klines_30 = _fetch_sina_kline(symbol, days=30)
+                    kline_raw_cache[symbol] = klines_30
                 klines_30 = kline_raw_cache.get(symbol)
                 if klines_30 and len(klines_30) >= 6:
                     vols = [k["volume"] for k in klines_30]
@@ -992,7 +1036,7 @@ def render_filter_funnel():
     # 数据源标识
     source_labels = {
         "eastmoney": ("✅", "东方财富"),
-        "sina": ("⚠️", "新浪财经（量比缺失）"),
+        "sina": ("⚠️", "新浪财经（K线补全量比）"),
         "akshare": ("⚠️", "akshare（备用源）"),
         "none": ("❌", "无可用数据源"),
     }
