@@ -301,6 +301,25 @@ def fetch_realtime_quotes():
         "valid_amount": int(df["成交额"].notna().sum()),
         "valid_turnover": int(df["换手率"].notna().sum()),
     }
+
+    # 量比补全：新浪数据源不返回量比字段，从K线数据计算（当日量/5日均量）
+    vol_na_mask = df["量比"].isna()
+    if vol_na_mask.any():
+        _vol_fill_count = 0
+        for idx in df[vol_na_mask].index:
+            try:
+                sym = str(df.loc[idx, "代码"]).zfill(6)
+                klines = fetch_daily_kline(sym, days=30)
+                if klines and len(klines) >= 6:
+                    vols = [k["volume"] for k in klines]
+                    avg_5d = sum(vols[-6:-1]) / 5
+                    if avg_5d > 0:
+                        df.loc[idx, "量比"] = round(vols[-1] / avg_5d, 2)
+                        _vol_fill_count += 1
+            except Exception:
+                pass
+        st.session_state["data_quality"]["vol_filled"] = _vol_fill_count
+
     return df
 
 # ============================================================
@@ -1340,6 +1359,10 @@ with st.sidebar:
     st.divider()
     st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
     st.caption("数据来源：东方财富 / 新浪财经 / akshare")
+    # 量比补全提示
+    dq = st.session_state.get("data_quality", {})
+    if dq.get("vol_filled", 0) > 0:
+        st.caption(f"⚡ 量比补全：已从K线数据为 {dq['vol_filled']} 只股票计算量比（当日量/5日均量）")
 
 # ---- 主页面内容 ----
 render_summary_panel()
