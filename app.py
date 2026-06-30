@@ -1026,13 +1026,16 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     df_result = pd.DataFrame(results[:max_stocks])
     df_result = df_result.drop(columns=["_sort_key"])
 
+    # 安全计算统计值：过滤掉 "-" 等非数值字段
+    _safe_pct = pd.to_numeric(df_result["涨跌幅%"], errors="coerce").dropna()
+    _safe_vol = pd.to_numeric(df_result["量比"], errors="coerce").dropna()
     summary = {
         "total_stocks": total,
         "passed": len(results),
         "displayed": min(len(results), max_stocks),
-        "avg_pct": round(df_result["涨跌幅%"].mean(), 2),
-        "max_vol_ratio": round(df_result["量比"].max(), 2),
-        "max_score": int(df_result["综合评分"].max()),
+        "avg_pct": round(_safe_pct.mean(), 2) if len(_safe_pct) > 0 else 0,
+        "max_vol_ratio": round(_safe_vol.max(), 2) if len(_safe_vol) > 0 else 0,
+        "max_score": int(df_result["综合评分"].max()) if len(df_result) > 0 else 0,
         "rush_distribution": df_result["抢筹"].value_counts().to_dict(),
         "errors": 0,
     }
