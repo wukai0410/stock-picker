@@ -692,12 +692,13 @@ def run_selection(enable_rush=True, max_stocks=30):
         turnover_max = config["turnover_max"] * 1.5         # 22.5%
         amount_min = config["amount_min"] * 0.3             # 3000万
     else:
-        pct_min = config["pct_min"]
-        pct_max = config["pct_max"]
-        vol_ratio_min = config["vol_ratio_min"]
-        turnover_min = config["turnover_min"]
-        turnover_max = config["turnover_max"]
-        amount_min = config["amount_min"]
+        # 尾盘时段：适度放宽（原值太严导致经常0结果）
+        pct_min = config["pct_min"] * 0.5          # 1.0%
+        pct_max = config["pct_max"] * 1.5          # 10.5%
+        vol_ratio_min = config["vol_ratio_min"] * 0.8   # 0.96
+        turnover_min = config["turnover_min"] * 0.6    # 1.8%
+        turnover_max = config["turnover_max"] * 1.2     # 18%
+        amount_min = config["amount_min"] * 0.6         # 6000万
 
     total = len(df)
     results = []
@@ -772,6 +773,66 @@ def run_selection(enable_rush=True, max_stocks=30):
 
     progress.progress(1.0, text="✅ 选股完成！")
     status_text.text(f"✅ 选股完成！共找到 {len(results)} 只候选股")
+
+    # 兜底：严格模式0结果时，自动用宽松条件再跑一次
+    if not results and is_tail:
+        st.info("🔍 严格模式无结果，自动切换宽松筛选...")
+        pct_min = max(0.3, config["pct_min"] * 0.2)       # 0.4%
+        pct_max = config["pct_max"] * 3                     # 21%
+        vol_ratio_min = 0.5                                  # 极低
+        turnover_min = 0.5                                   # 极低
+        turnover_max = config["turnover_max"] * 2             # 30%
+        amount_min = config["amount_min"] * 0.1              # 1000万
+        errors = 0
+        for i, (idx, row) in enumerate(df.iterrows()):
+            try:
+                symbol = str(row["代码"]).zfill(6)
+                name   = str(row["名称"])
+                chg    = float(row["涨跌幅"])
+                vol_ratio   = float(row["量比"]) if pd.notna(row["量比"]) else 1.5
+                amount      = float(row["成交额"])
+                turnover    = float(row["换手率"])
+                close       = float(row.get("最新价", 0))
+                if not (pct_min < chg < pct_max):
+                    continue
+                if vol_ratio < vol_ratio_min:
+                    continue
+                if not (turnover_min < turnover < turnover_max):
+                    continue
+                if amount < amount_min:
+                    continue
+                ma20 = fetch_ma20(symbol)
+                composite_score = calc_composite_score(vol_ratio, turnover, chg, close, ma20)
+                stage_info    = analyze_main_force_stage(vol_ratio, chg, turnover, close, ma20)
+                price_levels   = calc_price_levels(close, ma20, chg)
+                fund_summary = get_fund_flow_summary(symbol)
+                trend_info   = predict_trend(composite_score, stage_info, chg, fund_summary)
+                rush = {"label": "-", "score": 0, "detail": "-"}
+                results.append({
+                    "代码": symbol,
+                    "名称": name,
+                    "涨跌幅%":    round(chg, 2),
+                    "量比":       round(vol_ratio, 2),
+                    "换手率%":   round(turnover, 2),
+                    "成交额亿":   round(amount / 1e8, 2),
+                    "最新价":    round(close, 2),
+                    "MA20":       round(ma20, 2) if ma20 else "-",
+                    "综合评分":   composite_score,
+                    "主力阶段":   stage_info["stage"],
+                    "主力详情":   stage_info["detail"],
+                    "走势预判":   trend_info["trend"],
+                    "操作建议":   trend_info["suggestion"],
+                    "建议理由":   trend_info["reason"],
+                    "置信度":     trend_info["confidence"],
+                    "阻力位":     price_levels["resistance"],
+                    "支撑位":     price_levels["support"],
+                    "抢筹":       rush["label"],
+                    "抢筹评分":   rush["score"],
+                    "_sort_key":   composite_score,
+                })
+            except Exception:
+                errors += 1
+                continue
 
     if not results:
         st.warning("⚠️ 未找到符合条件的股票")
