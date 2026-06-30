@@ -1,4 +1,4 @@
-# app.py - 尾盘智能选股工具（AlphaFeed Pro 优先 + 东方财富兜底）
+# app.py - 尾盘智能选股工具（东方财富优先 + akshare 兜底）
 # -*- coding: utf-8 -*-
 import streamlit as st
 import akshare as ak
@@ -96,11 +96,19 @@ def _get_column(df: pd.DataFrame, candidates: list) -> str | None:
 def fetch_realtime_quotes():
     """
     获取全市场A股实时行情。
-    优先：AlphaFeed Pro（一次拉全市场，~5500只）
-    兜底：东方财富逐页抓取
+    优先：东方财富逐页抓取（量比完整）
+    兜底：AlphaFeed Pro（全市场，无量比）
     再兜底：akshare stock_zh_a_spot_em()
     """
-    # ---------- 方案A：AlphaFeed Pro ----------
+    # ---------- 方案A：东方财富逐页抓取 ----------
+    try:
+        df = _fetch_em_all_pages()
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        st.warning(f"⚠️ 东方财富行情失败：{e}，切换兜底方案...")
+
+    # ---------- 方案B：AlphaFeed Pro ----------
     if _HAS_ALPHAFEED:
         try:
             df = _af.quotes.get(universes=["CN_Stock"], to_dataframe=True)
@@ -129,7 +137,6 @@ def fetch_realtime_quotes():
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-                # AlphaFeed 无量比字段，用1.5作为默认值（中性）
                 if "量比" not in df.columns:
                     df["量比"] = 1.5
 
@@ -137,14 +144,6 @@ def fetch_realtime_quotes():
                              "成交额", "换手率", "最新价"]]
         except Exception as e:
             st.warning(f"⚠️ AlphaFeed 实时行情失败：{e}，切换兜底方案...")
-
-    # ---------- 方案B：东方财富逐页抓取 ----------
-    try:
-        df = _fetch_em_all_pages()
-        if df is not None and not df.empty:
-            return df
-    except Exception:
-        pass
 
     # ---------- 方案C：akshare 标准接口 ----------
     try:
@@ -253,9 +252,24 @@ def _fetch_em_all_pages() -> pd.DataFrame | None:
 def fetch_intraday_minute(symbol: str):
     """
     获取日内1分钟K线（用于抢筹分析）。
-    优先：AlphaFeed .intraday()
-    兜底：akshare stock_zh_a_hist_min_em()
+    优先：akshare stock_zh_a_hist_min_em()
+    兜底：AlphaFeed .intraday()
     """
+    # 优先：akshare
+    try:
+        df = ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")
+        if df is not None and not df.empty:
+            vol_col   = _get_column(df, ["成交量", "volume", "vol", "VOL"])
+            close_col = _get_column(df, ["收盘",   "close",  "price", "最新价"])
+            if vol_col is not None and close_col is not None:
+                df = df.rename(columns={vol_col: "volume", close_col: "close"})
+                df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+                df["close"]  = pd.to_numeric(df["close"],  errors="coerce")
+                return df.dropna(subset=["volume", "close"])
+    except Exception:
+        pass
+
+    # 兜底：AlphaFeed
     if _HAS_ALPHAFEED:
         try:
             df = _af.klines.intraday(symbol, count=240, to_dataframe=True)
@@ -269,21 +283,7 @@ def fetch_intraday_minute(symbol: str):
         except Exception:
             pass
 
-    # 兜底：akshare
-    try:
-        df = ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")
-        if df is None or df.empty:
-            return None
-        vol_col   = _get_column(df, ["成交量", "volume", "vol", "VOL"])
-        close_col = _get_column(df, ["收盘",   "close",  "price", "最新价"])
-        if vol_col is None or close_col is None:
-            return None
-        df = df.rename(columns={vol_col: "volume", close_col: "close"})
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-        df["close"]  = pd.to_numeric(df["close"],  errors="coerce")
-        return df.dropna(subset=["volume", "close"])
-    except Exception:
-        return None
+    return None
 
 
 @st.cache_data(ttl=300)
@@ -311,9 +311,23 @@ def fetch_a50_change() -> float:
 def fetch_ma20(symbol: str) -> float | None:
     """
     获取20日均线（MA20）。
-    优先：AlphaFeed klines.get（日线，前复权）
-    兜底：akshare stock_zh_a_hist
+    优先：akshare stock_zh_a_hist
+    兜底：AlphaFeed klines.get（日线，前复权）
     """
+    # 优先：akshare
+    try:
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily",
+                                 adjust="qfq", start_date="20240101")
+        if df is not None and not df.empty:
+            close_col = _get_column(df, ["收盘", "close"])
+            if close_col is not None:
+                closes = pd.to_numeric(df[close_col], errors="coerce").dropna()
+                if len(closes) >= 20:
+                    return round(closes.tail(20).mean(), 4)
+    except Exception:
+        pass
+
+    # 兜底：AlphaFeed
     if _HAS_ALPHAFEED:
         try:
             df = _af.klines.get(symbol, period="1d", count=30,
@@ -325,21 +339,7 @@ def fetch_ma20(symbol: str) -> float | None:
         except Exception:
             pass
 
-    # 兜底：akshare
-    try:
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily",
-                                 adjust="qfq", start_date="20240101")
-        if df is None or df.empty:
-            return None
-        close_col = _get_column(df, ["收盘", "close"])
-        if close_col is None:
-            return None
-        closes = pd.to_numeric(df[close_col], errors="coerce").dropna()
-        if len(closes) < 20:
-            return None
-        return round(closes.tail(20).mean(), 4)
-    except Exception:
-        return None
+    return None
 
 # ============================================================
 # 资金流向数据获取（akshare，AlphaFeed 暂不支持）
@@ -1070,7 +1070,7 @@ def main_page():
     )
 
     st.title("📈 尾盘智能选股工具")
-    st.caption("基于 AlphaFeed Pro + akshare 实时数据 + 综合评分系统 + 主力分析")
+    st.caption("基于东方财富 + akshare 实时数据 + 综合评分系统 + 主力分析")
 
     with st.sidebar:
         st.header("⚙️ 参数设置")
@@ -1123,7 +1123,7 @@ def main_page():
 
         st.divider()
         st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
-        src = "AlphaFeed Pro" if _HAS_ALPHAFEED else "akshare（AlphaFeed 不可用）"
+        src = "东方财富 + akshare"
         st.caption(f"📡 数据源：{src}")
 
     if st.session_state.get("selected_stock") is not None:
