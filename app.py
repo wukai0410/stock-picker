@@ -128,26 +128,6 @@ def fetch_intraday_minute(symbol: str):
     except Exception:
         return None
 
-@st.cache_data(ttl=300)
-def fetch_a50_change() -> float:
-    """获取富时A50涨跌幅（仅保留期货接口）"""
-    try:
-        df = ak.futures_zh_minute_sina(symbol="A50")
-        if df is None or df.empty or len(df) < 2:
-            return 0.0
-        price_col = _get_column(df, ["收盘价", "close", "price"])
-        if price_col is None:
-            return 0.0
-        prices = pd.to_numeric(df[price_col], errors="coerce").dropna()
-        if len(prices) < 2:
-            return 0.0
-        latest, prev = prices.iloc[-1], prices.iloc[-2]
-        if prev == 0:
-            return 0.0
-        return round((latest - prev) / prev * 100, 2)
-    except Exception:
-        return 0.0
-
 # ============================================================
 # 选股逻辑
 # ============================================================
@@ -381,19 +361,6 @@ def render_yesterday_review():
         else:
             st.info("📊 今日与昨日无重叠股票，市场风格可能切换")
 
-def render_a50_panel():
-    """渲染A50涨跌面板"""
-    a50_change = fetch_a50_change()
-    if a50_change is None:
-        st.caption("⚠️ 无法获取A50数据")
-        return
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if a50_change > 0:
-            st.metric("富时A50", f"+{a50_change:.2f}%")
-        else:
-            st.metric("富时A50", f"{a50_change:.2f}%")
-
 # ============================================================
 # Streamlit 主页面
 # ============================================================
@@ -460,8 +427,6 @@ with st.sidebar:
     st.caption("数据来源：akshare")
 
 # ---- 主页面 ----
-# 渲染A50面板
-render_a50_panel()
 # 渲染统计摘要
 render_summary_panel()
 # 加载并显示最近结果
