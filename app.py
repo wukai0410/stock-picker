@@ -1,15 +1,15 @@
-# app.py - 尾盘智能选股工具（纯东方财富版）
+# app.py - 尾盘智能选股工具（纯东方财富版 - 动态筛选）
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
 import time
+import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
-import os
 warnings.filterwarnings("ignore")
 
 # ============================================================
@@ -48,23 +48,65 @@ def get_config():
         "amount_min": st.session_state.get("cfg_amount_min", 1e8),
         "max_stocks": st.session_state.get("cfg_max_stocks", 30),
         "cache_ttl": 600,
-        "wecom": {
-            "corpid": os.environ.get("WECOM_CORPID", "wwab9a5075f240347d"),
-            "agentid": os.environ.get("WECOM_AGENTID", "1000002"),
-            "secret": os.environ.get("WECOM_SECRET", "jnwWrisTzy-ni2iFUOpdciihlGfs4DHQyhOqpj1AM_o"),
-            "touser": "@all",
-        }
     }
 
+def get_dynamic_filters():
+    """
+    根据当前时段动态调整筛选条件
+    返回: (pct_min, pct_max, vol_ratio_min, turnover_min, turnover_max, amount_min, mode_desc)
+    """
+    config = get_config()
+    now = beijing_now()
+    hour = now.hour
+    minute = now.minute
+
+    # 尾盘时段（14:30-15:00）：使用用户设定值
+    if hour == 14 and minute >= 30:
+        return (
+            config["pct_min"],
+            config["pct_max"],
+            config["vol_ratio_min"],
+            config["turnover_min"],
+            config["turnover_max"],
+            config["amount_min"],
+            "尾盘严格模式"
+        )
+    # 下午时段（13:00-14:29）：中等放宽
+    elif hour >= 13:
+        return (
+            max(0.5, config["pct_min"] * 0.6),
+            min(10.0, config["pct_max"] * 1.2),
+            max(0.5, config["vol_ratio_min"] * 0.7),
+            max(1.0, config["turnover_min"] * 0.6),
+            min(25.0, config["turnover_max"] * 1.2),
+            max(5e7, config["amount_min"] * 0.6),
+            "下午中等模式"
+        )
+    # 上午时段（9:30-12:59）：大幅放宽
+    else:
+        return (
+            max(0.3, config["pct_min"] * 0.4),
+            min(12.0, config["pct_max"] * 1.5),
+            max(0.3, config["vol_ratio_min"] * 0.5),
+            max(0.5, config["turnover_min"] * 0.4),
+            min(30.0, config["turnover_max"] * 1.5),
+            max(3e7, config["amount_min"] * 0.3),
+            "上午宽松模式"
+        )
+
 # ============================================================
-# 东方财富全市场行情（主力数据源）
+# 东方财富全市场行情
 # ============================================================
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_realtime_quotes():
+def fetch_realtime_quotes(use_mock: bool = False):
     """
     从东方财富 clist 接口获取全市场实时行情。
     返回统一列名：代码、名称、涨跌幅、量比、成交额、换手率、最新价
+    当 use_mock=True 或网络不可达时，返回模拟数据（用于演示）。
     """
+    if use_mock:
+        return _generate_mock_data()
+
     url = "https://push2.eastmoney.com/api/qt/clist/get"
     session = requests.Session()
     session.headers.update({
@@ -101,8 +143,9 @@ def fetch_realtime_quotes():
             break
 
     if not all_rows:
-        st.error("❌ 无法获取行情数据，请检查网络")
-        return None
+        # 网络不可达，自动切换模拟数据
+        st.warning("⚠️ 无法连接东方财富API，已自动切换为模拟演示数据")
+        return _generate_mock_data()
 
     df = pd.DataFrame(all_rows)
 
@@ -121,6 +164,28 @@ def fetch_realtime_quotes():
     return result
 
 
+def _generate_mock_data() -> pd.DataFrame:
+    """生成模拟行情数据，用于离线演示"""
+    import random
+    random.seed(42)
+    rows = []
+    # 生成约500只模拟股票
+    for i in range(500):
+        code = f"{600000 + i:06d}" if i < 250 else f"{300000 + (i-250):06d}"
+        name = f"模拟股票{i:03d}"
+        pct = round(random.uniform(-5.0, 9.0), 2)
+        price = round(random.uniform(5.0, 200.0), 2)
+        vol_ratio = round(random.uniform(0.3, 5.0), 2) if random.random() > 0.1 else None
+        turnover = round(random.uniform(1.0, 20.0), 2) if random.random() > 0.1 else None
+        amount = round(random.uniform(5e7, 5e9), 0)
+        rows.append({
+            "代码": code, "名称": name, "最新价": price,
+            "涨跌幅": pct, "量比": vol_ratio,
+            "换手率": turnover, "成交额": amount,
+        })
+    return pd.DataFrame(rows)
+
+
 # ============================================================
 # MA20 获取（akshare 历史数据）
 # ============================================================
@@ -129,8 +194,10 @@ def fetch_ma20(symbol: str) -> float | None:
     """获取个股20日均线（从 akshare 历史接口）"""
     try:
         import akshare as ak
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq",
-                                start_date=(datetime.now() - timedelta(days=60)).strftime("%Y%m%d"))
+        df = ak.stock_zh_a_hist(
+            symbol=symbol, period="daily", adjust="qfq",
+            start_date=(datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
+        )
         if df is None or df.empty or len(df) < 20:
             return None
         closes = pd.to_numeric(df["收盘"], errors="coerce").dropna()
@@ -297,7 +364,6 @@ def analyze_main_force_stage(vol_ratio: float | None, pct: float, turnover: floa
         confidence = "低"
     return {"stage": stage, "detail": detail, "confidence": confidence, "deviation": round(deviation, 2)}
 
-
 def predict_trend(score: int, stage_info: dict, pct: float, fund_summary: dict = None) -> dict:
     confidence = stage_info.get("confidence", "低")
     fund_boost = 0
@@ -345,7 +411,6 @@ def predict_trend(score: int, stage_info: dict, pct: float, fund_summary: dict =
 
     return {"trend": trend, "suggestion": suggestion, "reason": reason, "confidence": confidence, "fund_boost": fund_boost}
 
-
 def calc_price_levels(close: float, ma20: float | None, pct: float) -> dict:
     if ma20 is not None and ma20 > 0:
         support = round(ma20, 2)
@@ -358,7 +423,6 @@ def calc_price_levels(close: float, ma20: float | None, pct: float) -> dict:
         stop_loss = round(close * 0.92, 2)
         target = round(close * 1.05, 2)
     return {"current": round(close, 2), "buy_price": buy_price, "stop_loss": stop_loss, "target": target, "support": support}
-
 
 def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
     if df_1min is None or len(df_1min) < 10:
@@ -390,7 +454,6 @@ def calc_intraday_rush(df_1min: pd.DataFrame) -> dict:
     except Exception:
         return {"label": "异常", "score": 0, "detail": ""}
 
-
 def calc_pressure_test(close: float, slope_factor: float) -> dict:
     """量化测压"""
     a50_change = 0.0  # 简化版
@@ -407,7 +470,7 @@ def calc_pressure_test(close: float, slope_factor: float) -> dict:
 # ============================================================
 # 主选股逻辑
 # ============================================================
-def run_selection(enable_rush: bool = True, max_stocks: int = 30):
+def run_selection(enable_rush: bool = True, max_stocks: int = 30, dynamic: bool = True, use_mock: bool = False):
     now = beijing_now()
 
     if not is_trading_day():
@@ -417,18 +480,30 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     tail_time = is_tail_time()
     if not tail_time:
         enable_rush = False
-        st.info("ℹ️ 当前非尾盘时段，抢筹分析已自动跳过")
 
     status_text = st.empty()
     progress = st.progress(0.0, text="正在初始化...")
     status_text.text("⏳ 准备获取实时行情...")
 
-    df = fetch_realtime_quotes()
+    df = fetch_realtime_quotes(use_mock=use_mock)
     if df is None:
         st.error("❌ 无法获取实时行情")
         return None
 
-    config = get_config()
+    # 使用动态筛选条件
+    if dynamic:
+        pct_min, pct_max, vol_ratio_min, turnover_min, turnover_max, amount_min, mode_desc = get_dynamic_filters()
+        st.info(f"ℹ️ 当前模式：{mode_desc} | 涨幅 {pct_min:.1f}%-{pct_max:.1f}%，量比≥{vol_ratio_min:.1f}")
+    else:
+        config = get_config()
+        pct_min = config["pct_min"]
+        pct_max = config["pct_max"]
+        vol_ratio_min = config["vol_ratio_min"]
+        turnover_min = config["turnover_min"]
+        turnover_max = config["turnover_max"]
+        amount_min = config["amount_min"]
+        st.info(f"ℹ️ 使用固定条件 | 涨幅 {pct_min:.1f}%-{pct_max:.1f}%，量比≥{vol_ratio_min:.1f}")
+
     total = len(df)
 
     status_text.text("🔍 正在进行初筛...")
@@ -445,13 +520,13 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             close = float(row["最新价"]) if pd.notna(row.get("最新价")) else 0
             vol_ratio = float(row["量比"]) if pd.notna(row["量比"]) else None
 
-            if chg is None or not (config["pct_min"] < chg < config["pct_max"]):
+            if chg is None or not (pct_min < chg < pct_max):
                 continue
-            if amount is not None and amount < config["amount_min"]:
+            if amount is not None and amount < amount_min:
                 continue
-            if turnover is not None and not (config["turnover_min"] < turnover < config["turnover_max"]):
+            if turnover is not None and not (turnover_min < turnover < turnover_max):
                 continue
-            if vol_ratio is not None and vol_ratio < config["vol_ratio_min"]:
+            if vol_ratio is not None and vol_ratio < vol_ratio_min:
                 continue
 
             candidates.append({
@@ -464,9 +539,10 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
 
     if not candidates:
         progress.progress(1.0, text="✅ 选股完成！")
-        st.warning("⚠️ 未找到符合条件的股票")
+        st.warning("⚠️ 未找到符合条件的股票，请尝试放宽筛选条件")
         return None
 
+    # ---- 并行获取MA20 ----
     progress.progress(0.35, text="正在获取MA20...")
     ma20_map = {}
     with ThreadPoolExecutor(max_workers=10) as pool:
@@ -480,6 +556,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             except Exception:
                 pass
 
+    # ---- 并行获取资金流向 ----
     progress.progress(0.55, text="正在获取资金流向...")
     fund_map = {}
     with ThreadPoolExecutor(max_workers=10) as pool:
@@ -493,8 +570,9 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
             except Exception:
                 pass
 
+    # ---- 并行获取分时抢筹 ----
     rush_map = {}
-    if enable_rush:
+    if enable_rush and tail_time:
         progress.progress(0.75, text="正在分析分时抢筹...")
         with ThreadPoolExecutor(max_workers=10) as pool:
             def _fetch_rush(c):
@@ -518,6 +596,7 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     else:
         rush_map = {c["symbol"]: {"label": "-", "score": 0, "detail": "-", "pressure": {"premium": 0, "pl_ratio": 0}} for c in candidates}
 
+    # ---- 评分排序 ----
     progress.progress(0.9, text="正在评分排序...")
     results = []
     for c in candidates:
@@ -583,12 +662,6 @@ def run_selection(enable_rush: bool = True, max_stocks: int = 30):
     st.session_state["last_results"] = df_result
     st.session_state["last_results_ts"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
 
-    try:
-        if df_result is not None and not df_result.empty:
-            st.toast("✅ 选股完成！", icon="📈")
-    except Exception:
-        pass
-
     return df_result
 
 
@@ -612,7 +685,6 @@ def save_daily_results(df: pd.DataFrame):
     st.session_state["last_results"] = df
     st.session_state["last_results_ts"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
 
-
 def load_daily_results(date_str: str) -> pd.DataFrame | None:
     history = st.session_state.get("history_results", {})
     record = history.get(date_str)
@@ -620,13 +692,15 @@ def load_daily_results(date_str: str) -> pd.DataFrame | None:
         return None
     return pd.DataFrame(record["data"])
 
-
 def load_last_results() -> tuple[pd.DataFrame | None, str | None]:
     df = st.session_state.get("last_results")
     ts = st.session_state.get("last_results_ts")
     return df, ts
 
 
+# ============================================================
+# 渲染函数
+# ============================================================
 def render_summary_panel():
     summary = st.session_state.get("last_summary")
     if summary is None:
@@ -889,6 +963,7 @@ def main_page():
             st.warning("⚠️ 今日非交易日")
 
         st.subheader("📊 筛选条件")
+        st.caption("💡 非尾盘时段系统会自动放宽条件")
         pct_min = st.slider("涨跌幅下限 (%)", 0.0, 10.0, 2.0, 0.5, key="cfg_pct_min")
         pct_max = st.slider("涨跌幅上限 (%)", 0.0, 10.0, 7.0, 0.5, key="cfg_pct_max")
         vol_ratio_min = st.slider("量比下限", 0.5, 5.0, 1.2, 0.1, key="cfg_vol_ratio_min")
@@ -910,9 +985,16 @@ def main_page():
         max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 30, 5, key="cfg_max_stocks")
 
         st.divider()
+        # 演示模式开关
+        use_mock = st.checkbox("🎭 演示模式（离线模拟数据）", value=False,
+                                         help="勾选后使用模拟数据，无需连接东方财富API")
+        if use_mock:
+            st.caption("ℹ️ 演示模式下使用模拟数据，仅用于UI预览")
+
+        st.divider()
         if st.button("🔄 运行选股", use_container_width=True, type="primary"):
             with st.spinner("正在运行选股逻辑..."):
-                df = run_selection(enable_rush, max_stocks)
+                df = run_selection(enable_rush, max_stocks, use_mock=use_mock)
                 if df is not None:
                     save_daily_results(df)
                     st.success(f"✅ 选股完成，共 {len(df)} 只候选股")
@@ -934,15 +1016,17 @@ def main_page():
         st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
         st.caption("数据来源：东方财富")
 
-    # 自动运行逻辑
+    # ---- 自动运行逻辑 ----
+    # 从 session_state 读取演示模式设置
+    use_mock = st.session_state.get("use_mock", False)
     df_result, cached_ts = load_last_results()
     today = today_str()
     df_today = load_daily_results(today)
 
     if is_trading_day() and (df_today is None or df_today.empty):
         with st.spinner("📈 正在自动运行选股逻辑，请稍候..."):
-            enable_rush_temp = tail_time and trading_day
-            df_result = run_selection(enable_rush_temp, st.session_state.get("cfg_max_stocks", 30))
+            enable_rush_temp = is_tail_time() and is_trading_day()
+            df_result = run_selection(enable_rush_temp, st.session_state.get("cfg_max_stocks", 30), use_mock=use_mock)
             if df_result is not None:
                 save_daily_results(df_result)
                 st.rerun()
@@ -958,26 +1042,46 @@ def main_page():
         if cached_ts:
             st.caption(f"⏱️ 缓存时间戳：{cached_ts}")
 
-        df_display = df_result.copy()
-        df_display["代码链接"] = df_display["代码"].apply(
-            lambda x: f'<a href="https://quote.eastmoney.com/s/{x}.html" target="_blank">{x}</a>'
+        # 使用 st.dataframe 显示（支持列配置）
+        display_cols = ["代码", "名称", "最新价", "涨跌幅%", "量比", "换手率%", "综合评分", "主力阶段", "操作建议", "预期开盘溢价%", "盈亏比"]
+        st.dataframe(
+            df_result[display_cols],
+            column_config={
+                "代码": st.column_config.Column("代码", width="small"),
+                "名称": st.column_config.Column("名称", width="medium"),
+                "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
+                "涨跌幅%": st.column_config.NumberColumn("涨跌幅%", format="%.2f%%"),
+                "量比": st.column_config.NumberColumn("量比", format="%.2f"),
+                "换手率%": st.column_config.NumberColumn("换手率%", format="%.2f%%"),
+                "综合评分": st.column_config.NumberColumn("综合评分", format="%d"),
+                "主力阶段": st.column_config.Column("主力阶段", width="medium"),
+                "操作建议": st.column_config.Column("操作建议", width="medium"),
+                "预期开盘溢价%": st.column_config.NumberColumn("预期开盘溢价%", format="%.2f%%"),
+                "盈亏比": st.column_config.NumberColumn("盈亏比", format="%.2f"),
+            },
+            use_container_width=True,
+            hide_index=True,
         )
 
-        st.markdown(
-            df_display[["代码链接", "名称", "最新价", "涨跌幅%", "量比", "换手率%", "综合评分", "主力阶段", "操作建议", "预期开盘溢价%", "盈亏比"]].to_html(escape=False, index=False),
-            unsafe_allow_html=True
-        )
-
+        # 高分推荐
         st.subheader("⭐ 高分推荐（评分 ≥ 70）")
         high_score_df = df_result[df_result["综合评分"] >= 70]
         if not high_score_df.empty:
-            high_display = high_score_df.copy()
-            high_display["代码链接"] = high_display["代码"].apply(
-                lambda x: f'<a href="https://quote.eastmoney.com/s/{x}.html" target="_blank">{x}</a>'
-            )
-            st.markdown(
-                high_display[["代码链接", "名称", "最新价", "涨跌幅%", "量比", "换手率%", "综合评分", "主力阶段", "操作建议"]].to_html(escape=False, index=False),
-                unsafe_allow_html=True
+            st.dataframe(
+                high_score_df[["代码", "名称", "最新价", "涨跌幅%", "量比", "换手率%", "综合评分", "主力阶段", "操作建议"]],
+                column_config={
+                    "代码": st.column_config.Column("代码", width="small"),
+                    "名称": st.column_config.Column("名称", width="medium"),
+                    "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
+                    "涨跌幅%": st.column_config.NumberColumn("涨跌幅%", format="%.2f%%"),
+                    "量比": st.column_config.NumberColumn("量比", format="%.2f"),
+                    "换手率%": st.column_config.NumberColumn("换手率%", format="%.2f%%"),
+                    "综合评分": st.column_config.NumberColumn("综合评分", format="%d"),
+                    "主力阶段": st.column_config.Column("主力阶段", width="medium"),
+                    "操作建议": st.column_config.Column("操作建议", width="medium"),
+                },
+                use_container_width=True,
+                hide_index=True,
             )
             st.caption("💡 评分 ≥ 70 分的股票已用绿色背景高亮")
 
