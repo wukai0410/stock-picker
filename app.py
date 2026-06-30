@@ -25,8 +25,9 @@ def _is_market_open():
     return (930 <= t <= 1130) or (1300 <= t <= 1500)
 
 # ============================================================
-# 数据源：三级回退（东方财富 → 新浪 → akshare）
+# 数据源：四级回退（AlphaFeed → 新浪 → 东方财富 → akshare）
 # ============================================================
+ALPHAFEED_API_KEY = "sk_2aad58f5ac7741b287a0dfe8c2791514"
 EASTMONEY_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://quote.eastmoney.com/",
@@ -37,6 +38,84 @@ SINA_HEADERS = {
     "Referer": "https://finance.sina.com.cn",
     "Accept": "*/*",
 }
+
+def _fetch_alphafeed() -> pd.DataFrame | None:
+    """数据源1：AlphaFeed 量化接口（全A股行情，~2秒）"""
+    try:
+        from alphafeed import AlphaFeed
+        af = AlphaFeed(api_key=ALPHAFEED_API_KEY)
+        q = af.quotes.get(universes="CN_Stock", to_dataframe=True)
+        if q is None or q.empty:
+            return None
+        records = []
+        for _, row in q.iterrows():
+            symbol = str(row.get("symbol", ""))
+            if not symbol or "." not in symbol:
+                continue
+            code = symbol.split(".")[0]
+            if not code.isdigit() or len(code) != 6:
+                continue
+            try:
+                price = float(row["last_price"]) if pd.notna(row.get("last_price")) else None
+                prev = float(row["prev_close"]) if pd.notna(row.get("prev_close")) else None
+                chg_pct_raw = float(row["ext.change_pct"]) if pd.notna(row.get("ext.change_pct")) else None
+                # AlphaFeed涨跌幅为小数（如0.02表示2%），转为百分比
+                if chg_pct_raw is not None:
+                    if abs(chg_pct_raw) < 1:  # 小数形式
+                        chg_pct = round(chg_pct_raw * 100, 2)
+                    else:
+                        chg_pct = round(chg_pct_raw, 2)
+                elif price is not None and prev is not None and prev > 0:
+                    chg_pct = round((price - prev) / prev * 100, 2)
+                else:
+                    chg_pct = None
+                chg_amount = round(price - prev, 2) if (price is not None and prev is not None) else None
+                records.append({
+                    "代码": code,
+                    "名称": str(row.get("ext.name", "")),
+                    "涨跌幅": chg_pct,
+                    "最新价": price,
+                    "量比": None,  # AlphaFeed不直接提供量比，后续从K线补全
+                    "成交额": float(row["amount"]) if pd.notna(row.get("amount")) else None,
+                    "换手率": round(float(row["ext.turnover_rate"]) * 100, 2) if pd.notna(row.get("ext.turnover_rate")) else None,
+                    "涨跌额": chg_amount,
+                    "最高": float(row["high"]) if pd.notna(row.get("high")) else None,
+                    "最低": float(row["low"]) if pd.notna(row.get("low")) else None,
+                    "今开": float(row["open"]) if pd.notna(row.get("open")) else None,
+                    "昨收": prev,
+                    "市盈率": None,
+                    "总市值": None,
+                })
+            except Exception:
+                continue
+        return pd.DataFrame(records) if records else None
+    except Exception:
+        return None
+
+def _fetch_alphafeed_kline(symbol: str, days: int = 120) -> list[dict]:
+    """AlphaFeed日K线数据，返回 [{date, open, close, high, low, volume}, ...]"""
+    try:
+        from alphafeed import AlphaFeed
+        af = AlphaFeed(api_key=ALPHAFEED_API_KEY)
+        s = f"{symbol}.SH" if symbol.startswith(("6", "9")) else f"{symbol}.SZ"
+        k = af.klines.get(s, period="1d", count=days, adjust="forward", to_dataframe=True)
+        if k is None or k.empty:
+            return []
+        result = []
+        for _, row in k.iterrows():
+            try:
+                result.append({
+                    "date": str(row.get("trade_date", "")),
+                    "open": float(row["open"]), "close": float(row["close"]),
+                    "high": float(row["high"]), "low": float(row["low"]),
+                    "volume": float(row["volume"]),
+                    "amount": float(row.get("amount", 0)) if pd.notna(row.get("amount")) else 0,
+                })
+            except Exception:
+                continue
+        return result
+    except Exception:
+        return []
 
 def _em_fetch(url, params):
     try:
@@ -237,25 +316,25 @@ def _fetch_akshare() -> pd.DataFrame | None:
     except Exception:
         return None
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def fetch_realtime_quotes():
-    """三级回退获取全A股实时行情"""
+    """四级回退获取全A股实时行情"""
     df = None
     source_name = "none"
 
-    # 数据源1：东方财富
+    # 数据源1：AlphaFeed（商业量化接口，~2秒，数据完整）
     try:
-        df = _fetch_eastmoney()
+        df = _fetch_alphafeed()
         if df is not None and len(df) >= 100:
             valid_pct = df["涨跌幅"].notna().sum() if "涨跌幅" in df.columns else 0
             if valid_pct / len(df) > 0.5:
-                source_name = "eastmoney"
+                source_name = "alphafeed"
             else:
                 df = None
     except Exception:
         pass
 
-    # 数据源2：新浪
+    # 数据源2：新浪财经（免费API，~44秒，量比缺失）
     if df is None or len(df) < 100:
         try:
             df_sina = _fetch_sina()
@@ -265,7 +344,19 @@ def fetch_realtime_quotes():
         except Exception:
             pass
 
-    # 数据源3：akshare
+    # 数据源3：东方财富（免费API，可能被WAF封）
+    if df is None or len(df) < 100:
+        try:
+            df_em = _fetch_eastmoney()
+            if df_em is not None and len(df_em) >= 100:
+                valid_pct = df_em["涨跌幅"].notna().sum() if "涨跌幅" in df_em.columns else 0
+                if valid_pct / len(df_em) > 0.5:
+                    df = df_em
+                    source_name = "eastmoney"
+        except Exception:
+            pass
+
+    # 数据源4：akshare 终极回退
     if df is None or len(df) < 100:
         try:
             df_ak = _fetch_akshare()
@@ -302,20 +393,18 @@ def fetch_realtime_quotes():
         "valid_turnover": int(df["换手率"].notna().sum()),
     }
 
-    # 量比补全：新浪数据源不返回量比字段，从新浪K线数据计算（当日量/5日均量）
+    # 量比补全：AlphaFeed/新浪数据源不返回量比字段，从K线数据计算（当日量/5日均量）
     vol_na_mask = df["量比"].isna()
-    if vol_na_mask.any():
+    if vol_na_mask.any() and source_name in ("alphafeed", "sina"):
         _vol_fill_count = 0
-        _vol_fill_max = 200  # 最多补全200只，避免耗时过长（每只约0.2s）
-        # 先尝试东方财富K线（更快），失败后回退到新浪K线
+        _vol_fill_max = 200  # 最多补全200只
         for idx in df[vol_na_mask].index:
             if _vol_fill_count >= _vol_fill_max:
                 break
             try:
                 sym = str(df.loc[idx, "代码"]).zfill(6)
-                # 尝试东方财富K线
-                klines = fetch_daily_kline(sym, days=30)
-                # 如果东方财富失败（收盘后可能不可用），回退到新浪K线
+                # AlphaFeed K线优先，回退到新浪K线
+                klines = _fetch_alphafeed_kline(sym, days=30)
                 if not klines or len(klines) < 6:
                     klines = _fetch_sina_kline(sym, days=30)
                 if klines and len(klines) >= 6:
@@ -331,11 +420,17 @@ def fetch_realtime_quotes():
     return df
 
 # ============================================================
-# K线数据（日线，用于均线计算）
+# K线数据（日线，用于均线计算）—— 三级回退：AlphaFeed → 东方财富 → 新浪
 # ============================================================
 @st.cache_data(ttl=3600)
 def fetch_daily_kline(symbol: str, days: int = 120) -> list[dict]:
-    """获取日K线数据（东方财富），返回 [{date, open, close, high, low, volume}, ...]"""
+    """获取日K线数据（三级回退），返回 [{date, open, close, high, low, volume}, ...]"""
+    # 数据源1：AlphaFeed K线（前复权，数据最规范）
+    klines = _fetch_alphafeed_kline(symbol, days=days)
+    if klines and len(klines) >= days * 0.5:
+        return klines
+
+    # 数据源2：东方财富K线
     try:
         secid = f"1.{symbol}" if symbol.startswith("6") else f"0.{symbol}"
         url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -361,9 +456,13 @@ def fetch_daily_kline(symbol: str, days: int = 120) -> list[dict]:
                     "high": float(parts[3]), "low": float(parts[4]),
                     "volume": float(parts[5]), "amount": float(parts[6]),
                 })
-        return result
+        if result and len(result) >= days * 0.5:
+            return result
     except Exception:
-        return []
+        pass
+
+    # 数据源3：新浪K线（收盘后仍可用）
+    return _fetch_sina_kline(symbol, days=days)
 
 @st.cache_data(ttl=3600)
 def _fetch_sina_kline(symbol: str, days: int = 30) -> list[dict]:
@@ -1035,7 +1134,8 @@ def render_filter_funnel():
 
     # 数据源标识
     source_labels = {
-        "eastmoney": ("✅", "东方财富"),
+        "alphafeed": ("✅", "AlphaFeed（商业量化接口）"),
+        "eastmoney": ("⚠️", "东方财富"),
         "sina": ("⚠️", "新浪财经（K线补全量比）"),
         "akshare": ("⚠️", "akshare（备用源）"),
         "none": ("❌", "无可用数据源"),
@@ -1402,7 +1502,7 @@ with st.sidebar:
 
     st.divider()
     st.caption(f"🕐 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
-    st.caption("数据来源：东方财富 / 新浪财经 / akshare")
+    st.caption("数据来源：AlphaFeed / 新浪财经 / 东方财富 / akshare")
     # 量比补全提示
     dq = st.session_state.get("data_quality", {})
     if dq.get("vol_filled", 0) > 0:
