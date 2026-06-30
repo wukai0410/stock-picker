@@ -304,6 +304,88 @@ def fetch_realtime_quotes():
     return df
 
 # ============================================================
+# K线数据（日线，用于均线计算）
+# ============================================================
+@st.cache_data(ttl=3600)
+def fetch_daily_kline(symbol: str, days: int = 120) -> list[dict]:
+    """获取日K线数据（东方财富），返回 [{date, open, close, high, low, volume}, ...]"""
+    try:
+        secid = f"1.{symbol}" if symbol.startswith("6") else f"0.{symbol}"
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "secid": secid, "klt": 101, "fqt": 1,  # 日线，前复权
+            "end": "20500101", "lmt": days,
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "_": int(time.time() * 1000),
+        }
+        data = _em_fetch(url, params)
+        if data is None:
+            return []
+        klines = data.get("data", {}).get("klines", [])
+        result = []
+        for item in klines:
+            parts = item.split(",")
+            if len(parts) >= 7:
+                result.append({
+                    "date": parts[0],
+                    "open": float(parts[1]), "close": float(parts[2]),
+                    "high": float(parts[3]), "low": float(parts[4]),
+                    "volume": float(parts[5]), "amount": float(parts[6]),
+                })
+        return result
+    except Exception:
+        return []
+
+def calc_mas(klines: list[dict]) -> dict:
+    """从K线数据计算均线指标"""
+    if len(klines) < 60:
+        return {"ma5": None, "ma10": None, "ma20": None, "ma60": None,
+                "ma60_5d_ago": None, "ma_bullish": False, "high_10d": None,
+                "atr_14": None}
+    closes = [k["close"] for k in klines]
+    highs = [k["high"] for k in klines]
+    lows = [k["low"] for k in klines]
+
+    def sma(data, n):
+        if len(data) < n:
+            return None
+        return sum(data[-n:]) / n
+
+    ma5 = sma(closes, 5)
+    ma10 = sma(closes, 10)
+    ma20 = sma(closes, 20)
+    ma60 = sma(closes, 60)
+    # MA60 5日前
+    ma60_5d_ago = sma(closes[:-5], 60) if len(closes) > 65 else None
+    # 均线多头：MA5 > MA10 > MA20
+    ma_bullish = (ma5 and ma10 and ma20 and ma5 > ma10 > ma20)
+    # MA60 向上
+    ma60_up = (ma60 and ma60_5d_ago and ma60 > ma60_5d_ago)
+    # 10日最高价
+    high_10d = max(highs[-10:]) if len(highs) >= 10 else None
+    # ATR(14) 用于止损计算
+    tr_list = []
+    for i in range(1, len(highs)):
+        hl = highs[i] - lows[i]
+        hc = abs(highs[i] - closes[i-1])
+        lc = abs(lows[i] - closes[i-1])
+        tr_list.append(max(hl, hc, lc))
+    atr_14 = sum(tr_list[-14:]) / 14 if len(tr_list) >= 14 else None
+
+    return {
+        "ma5": round(ma5, 2) if ma5 else None,
+        "ma10": round(ma10, 2) if ma10 else None,
+        "ma20": round(ma20, 2) if ma20 else None,
+        "ma60": round(ma60, 2) if ma60 else None,
+        "ma_bullish": ma_bullish,
+        "ma60_up": ma60_up,
+        "high_10d": round(high_10d, 2) if high_10d else None,
+        "atr_14": round(atr_14, 2) if atr_14 else None,
+    }
+
+# ============================================================
 # 分时数据（抢筹分析）
 # ============================================================
 @st.cache_data(ttl=60)
@@ -671,11 +753,18 @@ def run_5d_selection(cfg: dict, max_stocks: int) -> pd.DataFrame | None:
     return df_result
 
 # ============================================================
-# 选股策略3：尾盘选股法
-# 策略：14:30-15:00 尾盘抢筹 + 次日冲高退出
+# 选股策略3：尾盘选股法（次日高开概率优化版）
+# 固定公式：6大条件
 # ============================================================
+TAIL_FORMULA = {
+    "pct_min": 3.0, "pct_max": 5.0,
+    "vol_ratio_min": 1.2,
+    "turnover_min": 5.0, "turnover_max": 10.0,
+    "mktcap_min": 50e8, "mktcap_max": 200e8,
+}
+
 def run_tail_selection(cfg: dict, max_stocks: int) -> pd.DataFrame | None:
-    """尾盘选股法"""
+    """尾盘选股法 — 次日高开概率优化版"""
     now = beijing_now()
 
     # 时段检查
@@ -695,8 +784,13 @@ def run_tail_selection(cfg: dict, max_stocks: int) -> pd.DataFrame | None:
     progress = st.progress(0.0, text="🕐 尾盘选股分析中...")
     status_text = st.empty()
     results = []
-    rush_cache = {}
-    diag = {"total": total, "pct_fail": 0, "vol_fail": 0, "amount_fail": 0, "rush_fail": 0, "pass": 0}
+    kline_cache: dict[str, dict] = {}
+    diag = {
+        "total": total,
+        "pct_fail": 0, "vol_fail": 0, "turnover_fail": 0,
+        "mktcap_fail": 0, "ma_fail": 0, "high_fail": 0,
+        "pass": 0, "kline_fail": 0, "errors": 0,
+    }
 
     for i, (idx, row) in enumerate(df.iterrows()):
         if i % 20 == 0:
@@ -706,45 +800,112 @@ def run_tail_selection(cfg: dict, max_stocks: int) -> pd.DataFrame | None:
             symbol = str(row["代码"]).zfill(6)
             name = str(row["名称"])
             if pd.isna(row["涨跌幅"]) or pd.isna(row["最新价"]):
+                diag["errors"] += 1
                 continue
+
             chg = float(row["涨跌幅"])
             price = float(row["最新价"])
             vol_ratio = float(row["量比"]) if pd.notna(row.get("量比")) else None
+            turnover = float(row["换手率"]) if pd.notna(row.get("换手率")) else None
             amount = float(row["成交额"]) if pd.notna(row.get("成交额")) else None
+            mktcap = float(row["总市值"]) if pd.notna(row.get("总市值")) else None
 
-            # 涨幅过滤
-            if not (cfg["pct_min"] < chg < cfg["pct_max"]):
+            # ---- 条件1：涨幅 3% <= chg <= 5% ----
+            if not (TAIL_FORMULA["pct_min"] <= chg <= TAIL_FORMULA["pct_max"]):
                 diag["pct_fail"] += 1
                 continue
 
-            # 量比过滤
-            if vol_ratio is not None and vol_ratio < cfg.get("vol_ratio_min", 1.3):
+            # ---- 条件2：量比 > 1.2 ----
+            if vol_ratio is not None and vol_ratio <= TAIL_FORMULA["vol_ratio_min"]:
                 diag["vol_fail"] += 1
                 continue
 
-            # 成交额过滤
-            if amount is not None and amount < cfg.get("amount_min", 5e7):
-                diag["amount_fail"] += 1
+            # ---- 条件3：换手率 5% <= turnover <= 10% ----
+            if turnover is not None:
+                if not (TAIL_FORMULA["turnover_min"] <= turnover <= TAIL_FORMULA["turnover_max"]):
+                    diag["turnover_fail"] += 1
+                    continue
+
+            # ---- 条件4：流通市值 50亿 <= mktcap <= 200亿 ----
+            if mktcap is not None:
+                if not (TAIL_FORMULA["mktcap_min"] <= mktcap <= TAIL_FORMULA["mktcap_max"]):
+                    diag["mktcap_fail"] += 1
+                    continue
+
+            # ---- 条件5 & 6：K线技术分析 ----
+            if symbol not in kline_cache:
+                klines = fetch_daily_kline(symbol, days=120)
+                if not klines or len(klines) < 60:
+                    kline_cache[symbol] = None
+                else:
+                    kline_cache[symbol] = calc_mas(klines)
+            mas = kline_cache.get(symbol)
+
+            if mas is None:
+                diag["kline_fail"] += 1
                 continue
 
-            # 抢筹评分过滤
-            if symbol not in rush_cache:
-                rush_cache[symbol] = calc_intraday_rush(fetch_intraday_minute(symbol))
-            rush = rush_cache[symbol]
-            if rush["score"] < cfg.get("tail_rush_score", 50):
-                diag["rush_fail"] += 1
+            # 条件5：均线多头（MA5 > MA10 > MA20）且 MA60 向上
+            if not (mas["ma_bullish"] and mas["ma60_up"]):
+                diag["ma_fail"] += 1
                 continue
 
+            # 条件6：尾盘创新高（10日新高）且收盘 > MA20
+            if mas["high_10d"] is None or mas["ma20"] is None:
+                diag["high_fail"] += 1
+                continue
+            if not (price >= mas["high_10d"] and price > mas["ma20"]):
+                diag["high_fail"] += 1
+                continue
+
+            # ---- 全部通过 ----
             diag["pass"] += 1
+
+            # 计算建议购入价和止损价
+            atr = mas.get("atr_14", 0) or 0
+            suggest_buy = round(price * 0.995, 2)  # 回踩0.5%购入
+            stop_loss = round(max(price - 2 * atr, price * 0.97), 2)  # 2倍ATR或3%止损
+            target_price = round(price * 1.03, 2)  # 目标3%止盈
+
+            # 走势预判
+            if mas["ma_bullish"] and mas["ma60_up"] and vol_ratio and vol_ratio > 1.5:
+                trend = "📈 强势看多 — 均线多头+量价配合，次日高开概率高"
+                recommend = "✅ 强烈推荐"
+                recommend_score = 90
+            elif mas["ma_bullish"] and mas["ma60_up"]:
+                trend = "📊 偏多 — 均线多头，关注次日量能配合"
+                recommend = "👍 推荐"
+                recommend_score = 75
+            elif mas["ma_bullish"]:
+                trend = "📉 谨慎 — 均线多头但MA60走平，次日需观察"
+                recommend = "⚠️ 谨慎推荐"
+                recommend_score = 60
+            else:
+                trend = "❓ 观望 — 技术形态不完整，建议观望"
+                recommend = "⛔ 不推荐"
+                recommend_score = 30
+
             results.append({
                 "代码": symbol, "名称": name,
-                "涨跌幅%": round(chg, 2), "最新价": round(price, 2),
+                "涨跌幅%": round(chg, 2),
+                "最新价": round(price, 2),
                 "量比": round(vol_ratio, 2) if vol_ratio is not None else None,
+                "换手率%": round(turnover, 2) if turnover is not None else None,
                 "成交额亿": round(amount / 1e8, 2) if amount is not None else None,
-                "抢筹": rush["label"], "抢筹评分": rush["score"],
-                "次日策略": "冲高止盈（建议次日10:00前卖出）",
+                "总市值亿": round(mktcap / 1e8, 2) if mktcap is not None else None,
+                "MA5": mas["ma5"], "MA10": mas["ma10"], "MA20": mas["ma20"],
+                "MA60": mas["ma60"], "MA60向上": "✅" if mas["ma60_up"] else "❌",
+                "10日新高": "✅" if price >= (mas["high_10d"] or 0) else "❌",
+                "ATR(14)": mas.get("atr_14"),
+                "建议购入价": suggest_buy,
+                "止损价": stop_loss,
+                "目标价": target_price,
+                "走势预判": trend,
+                "推荐": recommend,
+                "_score": recommend_score,
             })
         except Exception:
+            diag["errors"] += 1
             continue
 
     progress.progress(1.0, text="✅ 尾盘选股完成！")
@@ -755,14 +916,16 @@ def run_tail_selection(cfg: dict, max_stocks: int) -> pd.DataFrame | None:
         st.warning(f"⚠️ 未找到符合条件的尾盘候选股")
         return None
 
-    results.sort(key=lambda x: x["抢筹评分"], reverse=True)
+    results.sort(key=lambda x: x["_score"], reverse=True)
     df_result = pd.DataFrame(results[:max_stocks])
+    df_result = df_result.drop(columns=["_score"])
 
     st.session_state["last_summary"] = {
         "mode": "尾盘选股",
         "total_stocks": total, "passed": len(results), "displayed": min(len(results), max_stocks),
-        "avg_rush": round(df_result["抢筹评分"].mean(), 1),
-        "max_rush": df_result["抢筹评分"].max(),
+        "avg_pct": round(df_result["涨跌幅%"].mean(), 2),
+        "max_vol": df_result["量比"].max() if "量比" in df_result.columns else 0,
+        "recommend_count": len(df_result[df_result["推荐"].str.contains("强烈|推荐")]) if "推荐" in df_result.columns else 0,
     }
     return df_result
 
@@ -825,12 +988,26 @@ def render_filter_funnel():
     # 通用漏斗
     if "pct_fail" in diag:
         pass_cnt = diag.get("pass", 0)
-        c[0].metric("总股票", total)
-        c[1].metric("通过筛选", pass_cnt)
-        c[2].metric("涨幅淘汰", diag.get("pct_fail", 0))
-        c[3].metric("量比淘汰", diag.get("vol_fail", 0))
-        c[4].metric("成交额淘汰", diag.get("amount_fail", 0))
-        c[5].metric("数据异常", diag.get("nan_count", diag.get("errors", 0)))
+        # 尾盘漏斗有更多阶段
+        if "ma_fail" in diag:
+            c[0].metric("总股票", total)
+            c[1].metric("通过筛选", pass_cnt)
+            c[2].metric("涨幅淘汰", diag.get("pct_fail", 0))
+            c[3].metric("量比淘汰", diag.get("vol_fail", 0))
+            c[4].metric("换手率淘汰", diag.get("turnover_fail", 0))
+            c[5].metric("市值淘汰", diag.get("mktcap_fail", 0))
+            c2 = st.columns(5)
+            c2[0].metric("均线淘汰", diag.get("ma_fail", 0))
+            c2[1].metric("新高淘汰", diag.get("high_fail", 0))
+            c2[2].metric("K线缺失", diag.get("kline_fail", 0))
+            c2[3].metric("数据异常", diag.get("errors", 0))
+        else:
+            c[0].metric("总股票", total)
+            c[1].metric("通过筛选", pass_cnt)
+            c[2].metric("涨幅淘汰", diag.get("pct_fail", 0))
+            c[3].metric("量比淘汰", diag.get("vol_fail", 0))
+            c[4].metric("成交额淘汰", diag.get("amount_fail", 0))
+            c[5].metric("数据异常", diag.get("nan_count", diag.get("errors", 0)))
         if total > 0:
             pct = pass_cnt / total
             st.progress(pct, text=f"筛选通过率：{pct*100:.1f}%")
@@ -859,11 +1036,12 @@ def render_summary_panel():
         c[3].metric("平均分", f"{summary['avg_score']}")
         c[4].metric("最高分", f"{summary['top_score']}")
     elif mode == "尾盘选股":
-        c = st.columns(4)
+        c = st.columns(5)
         c[0].metric("总股票数", summary["total_stocks"])
         c[1].metric("通过筛选", f"{summary['passed']} 只")
-        c[2].metric("平均抢筹", f"{summary['avg_rush']}")
-        c[3].metric("最高抢筹", f"{summary['max_rush']}")
+        c[2].metric("展示数量", f"{summary['displayed']} 只")
+        c[3].metric("平均涨幅", f"{summary['avg_pct']}%")
+        c[4].metric("推荐数量", f"{summary['recommend_count']} 只")
     else:
         c = st.columns(6)
         c[0].metric("总股票数", summary["total_stocks"])
@@ -878,16 +1056,33 @@ def render_summary_panel():
     st.divider()
 
 def render_results_table(df: pd.DataFrame, mode: str):
-    """渲染结果表格"""
+    """渲染结果表格 + 个股详情"""
     st.subheader("📋 候选股列表")
     if mode == "五维选股":
         display_cols = ["代码", "名称", "涨跌幅%", "最新价", "五维总分", "技术面", "资金面", "消息面", "基本面", "市场情绪"]
     elif mode == "尾盘选股":
-        display_cols = ["代码", "名称", "涨跌幅%", "最新价", "量比", "成交额亿", "抢筹", "抢筹评分", "次日策略"]
+        display_cols = ["代码", "名称", "涨跌幅%", "最新价", "量比", "换手率%", "总市值亿",
+                        "MA5", "MA20", "MA60", "MA60向上", "10日新高",
+                        "建议购入价", "止损价", "走势预判", "推荐"]
     else:
         display_cols = ["代码", "名称", "涨跌幅%", "量比", "换手率%", "成交额亿", "最新价", "抢筹"]
     display_cols = [c for c in display_cols if c in df.columns]
+
+    # 使用 selectbox 实现"点击查看详情"
+    st.caption("💡 在下方选择股票代码查看详情，或点击数据框列头排序")
     st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+
+    # 个股详情入口
+    st.divider()
+    stock_codes = df["代码"].tolist()
+    stock_names = df["名称"].tolist() if "名称" in df.columns else stock_codes
+    options = [f"{c} - {n}" for c, n in zip(stock_codes, stock_names)]
+    selected = st.selectbox("🔍 选择股票查看详情", options, key="detail_select")
+
+    if selected:
+        code = selected.split(" - ")[0]
+        row = df[df["代码"] == code].iloc[0]
+        render_stock_detail(row, mode)
 
     # 下载按钮
     csv_data = df.to_csv(index=False, encoding="utf-8-sig")
@@ -896,6 +1091,102 @@ def render_results_table(df: pd.DataFrame, mode: str):
         csv_data, f"选股结果_{mode}_{today_str()}.csv", "text/csv",
         use_container_width=True,
     )
+
+def render_stock_detail(row: pd.Series, mode: str):
+    """个股详情页：现价、建议购入价、止损价、走势预判、推荐"""
+    code = str(row["代码"]).zfill(6)
+    name = str(row.get("名称", code))
+    price = row.get("最新价", 0)
+    chg = row.get("涨跌幅%", 0)
+
+    st.subheader(f"📊 {code} {name} 个股详情")
+
+    # ---- 核心数据卡片 ----
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("现价", f"¥{price:.2f}", f"{chg:+.2f}%")
+    c2.metric("今开", f"¥{row.get('今开', '-')}" if pd.notna(row.get('今开')) else "-")
+    c3.metric("昨收", f"¥{row.get('昨收', '-')}" if pd.notna(row.get('昨收')) else "-")
+    c4.metric("最高", f"¥{row.get('最高', '-')}" if pd.notna(row.get('最高')) else "-")
+    c5.metric("最低", f"¥{row.get('最低', '-')}" if pd.notna(row.get('最低')) else "-")
+
+    # ---- 交易建议 ----
+    st.subheader("💡 交易建议")
+    suggest_buy = row.get("建议购入价")
+    stop_loss = row.get("止损价")
+    target_price = row.get("目标价")
+
+    bc1, bc2, bc3 = st.columns(3)
+    if suggest_buy is not None and pd.notna(suggest_buy):
+        bc1.metric("建议购入价", f"¥{suggest_buy:.2f}",
+                    f"{(suggest_buy / price - 1) * 100:+.1f}%" if price else "")
+    else:
+        bc1.metric("建议购入价", "—")
+
+    if stop_loss is not None and pd.notna(stop_loss):
+        bc2.metric("止损价", f"¥{stop_loss:.2f}",
+                    f"{(stop_loss / price - 1) * 100:+.1f}%" if price else "",
+                    delta_color="inverse")
+    else:
+        bc2.metric("止损价", "—")
+
+    if target_price is not None and pd.notna(target_price):
+        bc3.metric("目标价", f"¥{target_price:.2f}",
+                    f"{(target_price / price - 1) * 100:+.1f}%" if price else "")
+    else:
+        bc3.metric("目标价", "—")
+
+    # ---- 走势预判 & 推荐 ----
+    trend = row.get("走势预判", "暂无数据")
+    recommend = row.get("推荐", "暂无数据")
+
+    st.subheader("🔮 走势预判")
+    st.markdown(f"**{trend}**")
+
+    st.subheader("⭐ 是否推荐购入")
+    if "强烈推荐" in str(recommend):
+        st.success(f"**{recommend}**")
+    elif "推荐" in str(recommend):
+        st.info(f"**{recommend}**")
+    elif "谨慎" in str(recommend):
+        st.warning(f"**{recommend}**")
+    else:
+        st.error(f"**{recommend}**")
+
+    # ---- 均线详情（尾盘模式） ----
+    if mode == "尾盘选股":
+        st.subheader("📈 均线系统")
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("MA5", row.get("MA5", "-"))
+        mc2.metric("MA10", row.get("MA10", "-"))
+        mc3.metric("MA20", row.get("MA20", "-"))
+        mc4.metric("MA60", row.get("MA60", "-"))
+
+        ac1, ac2, ac3 = st.columns(3)
+        ac1.metric("MA60方向", row.get("MA60向上", "-"))
+        ac2.metric("10日新高", row.get("10日新高", "-"))
+        atr_val = row.get("ATR(14)")
+        ac3.metric("ATR(14)", f"{atr_val:.2f}" if atr_val and pd.notna(atr_val) else "-")
+
+        # 技术指标说明
+        st.caption("""
+        **技术指标说明：**
+        - **均线多头**：MA5 > MA10 > MA20，短期趋势向上
+        - **MA60向上**：中期趋势确认，减少假突破风险
+        - **10日新高**：突破近期压力位，多头力量强势
+        - **收盘 > MA20**：股价站稳均线上方，有支撑
+        - **ATR(14)**：平均真实波幅，用于计算止损距离
+        """)
+
+    # ---- K线预览 ----
+    with st.expander("📉 查看K线数据（近30日）", expanded=False):
+        klines = fetch_daily_kline(code, days=30)
+        if klines:
+            kdf = pd.DataFrame(klines)
+            kdf = kdf[["date", "open", "close", "high", "low", "volume"]]
+            kdf.columns = ["日期", "开盘", "收盘", "最高", "最低", "成交量"]
+            st.dataframe(kdf.tail(10), use_container_width=True, hide_index=True)
+        else:
+            st.caption("暂无K线数据")
 
 # ============================================================
 # Streamlit 主页面
@@ -993,19 +1284,21 @@ with st.sidebar:
 
     elif mode == "尾盘选股":
         st.subheader("🕐 尾盘选股参数")
-        st.caption("策略：14:30-15:00 尾盘抢筹 + 次日冲高退出")
-        tail_pct_min = st.number_input("涨幅下限(%)", -5.0, 10.0, 0.0, 0.5)
-        tail_pct_max = st.number_input("涨幅上限(%)", -5.0, 10.0, 5.0, 0.5)
-        tail_vol_ratio = st.number_input("量比下限（尾盘）", 1.0, 5.0, 1.3, 0.1)
-        tail_amount_min = st.number_input("成交额下限(亿)（尾盘）", 0.5, 10.0, 0.5, 0.5) * 1e8
-        tail_rush_score = st.number_input("最低抢筹评分", 0, 100, 50, 5)
+        st.caption("固定公式：次日高开概率优化版")
+        st.markdown("""
+        | 条件 | 阈值 |
+        |------|------|
+        | 涨幅 | 3% ~ 5% |
+        | 量比 | > 1.2 |
+        | 换手率 | 5% ~ 10% |
+        | 流通市值 | 50亿 ~ 200亿 |
+        | 均线 | MA5 > MA10 > MA20，MA60↑ |
+        | 尾盘 | 10日新高 + 收盘 > MA20 |
+        """)
         tail_only_tail = st.checkbox("仅尾盘时段运行（14:30-15:00）", value=True)
-        enable_rush = True
         max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 20, 5)
         config = {
-            "pct_min": tail_pct_min, "pct_max": tail_pct_max,
-            "vol_ratio_min": tail_vol_ratio, "amount_min": tail_amount_min,
-            "tail_rush_score": tail_rush_score, "tail_only_tail": tail_only_tail,
+            "tail_only_tail": tail_only_tail,
         }
 
     st.divider()
