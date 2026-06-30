@@ -667,11 +667,6 @@ def run_selection(enable_rush=True, max_stocks=30):
         st.warning("⚠️ 今日非交易日，请于交易日运行时再试")
         return None
 
-    tail_time = is_tail_time()
-    if not tail_time:
-        enable_rush = False
-        st.info("ℹ️ 当前非尾盘时段，抢筹分析已自动跳过")
-
     st.session_state["rush_actual_enabled"] = enable_rush
 
     status_text = st.empty()
@@ -1060,23 +1055,17 @@ def main_page():
     with st.sidebar:
         st.header("⚙️ 参数设置")
         now = beijing_now()
-        tail_time = is_tail_time()
         trading_day = is_trading_day()
 
-        if tail_time and trading_day:
-            st.success("✅ 已进入尾盘时段（14:30-15:00）")
-        elif trading_day:
-            st.info("ℹ️ 交易时段，尾盘分析将在14:30后可用")
+        if trading_day:
+            st.success("✅ 交易日 - 选股工具已就绪")
         else:
             st.warning("⚠️ 今日非交易日")
 
         enable_rush = st.checkbox(
             "🔍 启用尾盘抢筹分析",
-            value=tail_time and trading_day,
-            disabled=not (tail_time and trading_day),
+            value=True,
         )
-        if not (tail_time and trading_day):
-            st.caption("ℹ️ 抢筹分析已禁用（非尾盘时段）")
 
         max_stocks = st.number_input("📋 最多显示候选股数", 10, 100, 30, 5)
 
