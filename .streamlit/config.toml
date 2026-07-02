@@ -8,5 +8,3 @@ font="sans serif"
 
 [server]
 maxUploadSize=10
-enableXsrfProtection=false
-enableCORS=false

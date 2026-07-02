@@ -6,10 +6,10 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
-import json
 import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
+from urllib.parse import quote
 
 # ============================================================
 # 页面配置
@@ -56,6 +56,14 @@ MARKET_CLOSE = {"hour": 15, "min": 0}
 AF_API_KEY = "sk_2aad58f5ac7741b287a0dfe8c2791514"
 AF_BASE = "https://api.alphafeed.org"
 
+# 统一的HTTP请求头，降低被WAF拦截概率
+EM_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
+    'Accept': 'application/json, text/javascript, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Referer': 'https://quote.eastmoney.com/',
+}
+
 # ============================================================
 # Session State 初始化
 # ============================================================
@@ -73,6 +81,8 @@ if 'scan_count' not in st.session_state:
     st.session_state.scan_count = 0
 if 'last_scan_time' not in st.session_state:
     st.session_state.last_scan_time = None
+if 'af_quota_exhausted' not in st.session_state:
+    st.session_state.af_quota_exhausted = False
 
 # ============================================================
 # 数据层
@@ -83,12 +93,8 @@ def fetch_index_quotes():
     """获取三大指数实时行情，带多源回退"""
     # 尝试东方财富
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://quote.eastmoney.com/'
-        }
         url = "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f1,f2,f3,f4,f12,f13,f14&secids=1.000001,0.399001,0.399006"
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=EM_HEADERS, timeout=10)
         data = resp.json()
         diffs = data.get('data', {}).get('diff', [])
         result = {}
@@ -159,14 +165,25 @@ def fetch_index_quotes():
     st.warning("指数数据获取失败: 所有数据源均不可用")
     return {}
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=120)
 def fetch_alpha_feed_quotes():
-    """AlphaFeed 全市场实时行情"""
+    """AlphaFeed 全市场实时行情（额度受限，作为备用源）"""
+    # 如果已知额度已耗尽，直接跳过，避免反复触发 429
+    if st.session_state.get('af_quota_exhausted', False):
+        return []
+
     try:
         url = f"{AF_BASE}/v1/quotes?universes=CN_Stock"
         resp = requests.get(url, headers={'X-API-Key': AF_API_KEY, 'User-Agent': 'Mozilla/5.0'}, timeout=30)
+
+        if resp.status_code == 429:
+            st.session_state.af_quota_exhausted = True
+            st.warning("AlphaFeed 额度已用尽（429），已自动降级到东方财富数据源")
+            return []
+
         if resp.status_code != 200:
             return []
+
         json_data = resp.json()
         data_list = json_data.get('data', [])
         if not isinstance(data_list, list):
@@ -204,7 +221,7 @@ def fetch_alpha_feed_quotes():
 
 @st.cache_data(ttl=120)
 def fetch_em_list(board='all', page=1, page_size=100):
-    """东方财富全市场列表"""
+    """东方财富全市场列表（带重试）"""
     fs_map = {
         'sh': 'm:1+t:2,m:1+t:23',
         'sz': 'm:0+t:6,m:0+t:80',
@@ -213,79 +230,96 @@ def fetch_em_list(board='all', page=1, page_size=100):
         'all': 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23'
     }
     fs = fs_map.get(board, fs_map['all'])
-    try:
-        url = (
-            f"https://push2.eastmoney.com/api/qt/clist/get"
-            f"?pn={page}&pz={page_size}&po=1&np=1&ut=&fltt=2&invt=2&fid=f3"
-            f"&fs={fs}"
-            f"&fields=f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62"
-        )
-        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'}, timeout=15)
-        data = resp.json()
-        diffs = data.get('data', {}).get('diff', [])
-        if not diffs:
+    fields = 'f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62'
+
+    for attempt in range(2):
+        try:
+            url = (
+                f"https://push2.eastmoney.com/api/qt/clist/get"
+                f"?pn={page}&pz={page_size}&po=1&np=1&ut=&fltt=2&invt=2&fid=f3"
+                f"&fs={quote(fs, safe=':,+')}"
+                f"&fields={fields}"
+            )
+            resp = requests.get(url, headers=EM_HEADERS, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            diffs = data.get('data', {}).get('diff', [])
+            if not diffs:
+                return []
+            results = []
+            for d in diffs:
+                f10 = d.get('f10', 0)
+                f10_val = float(f10) if f10 and f10 != '-' else None
+                results.append({
+                    'code': d.get('f12', ''),
+                    'name': d.get('f14', ''),
+                    'current': d.get('f2', 0) or 0,
+                    'changePercent': d.get('f3', 0) or 0,
+                    'change': d.get('f4', 0) or 0,
+                    'volume': d.get('f5', 0) or 0,
+                    'amount': d.get('f6', 0) or 0,
+                    'amplitude': d.get('f7', 0) or 0,
+                    'turnover': d.get('f8', 0) or 0,
+                    'vol_ratio': f10_val,
+                    'open': d.get('f17', 0) or 0,
+                    'prevClose': d.get('f18', 0) or 0,
+                    'high': d.get('f15', 0) or 0,
+                    'low': d.get('f16', 0) or 0,
+                    'pe': d.get('f9', 0) or 0,
+                    'float_mktcap': d.get('f21', 0) or 0,
+                    'mktcap': d.get('f20', 0) or 0,
+                    'sector_flow': (d.get('f62') / 1e4) if d.get('f62') else None,
+                    'score': 0,
+                    'signals': [],
+                })
+            return results
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            st.warning(f"东方财富数据获取失败: {e}")
             return []
-        results = []
-        for d in diffs:
-            f10 = d.get('f10', 0)
-            f10_val = float(f10) if f10 and f10 != '-' else None
-            results.append({
-                'code': d.get('f12', ''),
-                'name': d.get('f14', ''),
-                'current': d.get('f2', 0) or 0,
-                'changePercent': d.get('f3', 0) or 0,
-                'change': d.get('f4', 0) or 0,
-                'volume': d.get('f5', 0) or 0,
-                'amount': d.get('f6', 0) or 0,
-                'amplitude': d.get('f7', 0) or 0,
-                'turnover': d.get('f8', 0) or 0,
-                'vol_ratio': f10_val,
-                'open': d.get('f17', 0) or 0,
-                'prevClose': d.get('f18', 0) or 0,
-                'high': d.get('f15', 0) or 0,
-                'low': d.get('f16', 0) or 0,
-                'pe': d.get('f9', 0) or 0,
-                'float_mktcap': d.get('f21', 0) or 0,
-                'mktcap': d.get('f20', 0) or 0,
-                'sector_flow': (d.get('f62') / 1e4) if d.get('f62') else None,
-                'score': 0,
-                'signals': [],
-            })
-        return results
-    except Exception as e:
-        st.warning(f"东方财富数据获取失败: {e}")
-        return []
 
 
 def fetch_em_flow_batch(codes: List[str]) -> Dict[str, float]:
-    """批量获取主力资金流向 - 通过东方财富API"""
+    """批量获取主力资金流向 - 通过东方财富API（带重试）"""
     if not codes:
         return {}
-    try:
-        secids = []
-        for c in codes:
-            if c.startswith('6') or c.startswith('9'):
-                secids.append(f"1.{c}")
-            elif c.startswith('0') or c.startswith('3'):
-                secids.append(f"0.{c}")
-            elif c.startswith('8') or c.startswith('4'):
-                secids.append(f"0.{c}")
-        if not secids:
-            return {}
-        secids_str = ','.join(secids[:200])  # 限制批量大小
-        url = f"https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f62,f184&secids={secids_str}"
-        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'}, timeout=15)
-        data = resp.json()
-        diffs = data.get('data', {}).get('diff', [])
-        result = {}
-        for d in (diffs or []):
-            code = d.get('f12', '')
-            flow = d.get('f62')  # 主力净流入(元)
-            if flow is not None:
-                result[code] = flow / 1e4  # 转为万元
-        return result
-    except Exception:
+
+    secids = []
+    for c in codes:
+        if c.startswith('6') or c.startswith('9'):
+            secids.append(f"1.{c}")
+        elif c.startswith('0') or c.startswith('3'):
+            secids.append(f"0.{c}")
+        elif c.startswith('8') or c.startswith('4'):
+            secids.append(f"0.{c}")
+    if not secids:
         return {}
+
+    secids_str = ','.join(secids[:200])
+
+    for attempt in range(2):
+        try:
+            url = f"https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f62,f184&secids={secids_str}"
+            resp = requests.get(url, headers=EM_HEADERS, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            diffs = data.get('data', {}).get('diff', [])
+            result = {}
+            for d in (diffs or []):
+                code = d.get('f12', '')
+                flow = d.get('f62')  # 主力净流入(元)
+                if flow is not None:
+                    result[code] = flow / 1e4  # 转为万元
+            return result
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            return {}
+
+    return {}
 
 
 # ============================================================
@@ -501,19 +535,11 @@ def get_strategy_text(stock: Dict) -> str:
     else:
         lines.append("主力资金方向不明确，关注后续动向。")
 
-    lines.append("")
-    lines.append(
-        f"【价格面】当前涨幅 {chg:.2f}%，"
-        f"量比 {vr:.2f}" if vr else '--',
-        f"换手 {turnover:.1f}%" if turnover else '--',
-        f"流通市值 {mc_str}。"
-    )
-    # 去掉上面的换行拼接
     price_line = f"【价格面】当前涨幅 {chg:.2f}%，"
     price_line += f"量比 {vr:.2f}，" if vr else "量比 --，"
     price_line += f"换手 {turnover:.1f}%，" if turnover else "换手 --，"
     price_line += f"流通市值 {mc_str}。"
-    lines[-1] = price_line
+    lines.append(price_line)
 
     if 4.5 <= chg <= 5.5 and vr and vr >= 1.8:
         lines.append("尾盘强势拉升特征明显，量能配合良好，属强势尾盘介入标的。")
@@ -924,18 +950,27 @@ def render_watchlist_page():
         st.info("暂无自选股，在上方添加")
         return
 
-    # 刷新自选股数据
+    # 刷新自选股数据（优先东方财富，AlphaFeed仅作回退）
     if st.button("🔄 刷新自选股行情"):
         codes = [w['code'] for w in st.session_state.watchlist]
-        all_stocks = fetch_alpha_feed_quotes()
-        stock_map = {s['code']: s for s in all_stocks}
+        stock_map = {}
 
-        # 如果AlphaFeed没数据，用东方财富
-        if not all_stocks:
+        # 优先使用东方财富
+        try:
             em_stocks = []
-            for page in range(1, 3):
-                em_stocks.extend(fetch_em_list('all', page, 100))
+            for page in range(1, 4):
+                batch = fetch_em_list('all', page, 100)
+                if not batch:
+                    break
+                em_stocks.extend(batch)
             stock_map = {s['code']: s for s in em_stocks}
+        except Exception as e:
+            st.warning(f"东方财富自选股刷新失败: {e}")
+
+        # 东方财富失败或数据不全时，再尝试 AlphaFeed
+        if not stock_map:
+            all_stocks = fetch_alpha_feed_quotes()
+            stock_map = {s['code']: s for s in all_stocks}
 
         for w in st.session_state.watchlist:
             s = stock_map.get(w['code'])
@@ -1008,10 +1043,6 @@ def main():
 
     with tab3:
         render_report_page()
-
-    # 自动刷新（每30秒）
-    time.sleep(0.1)  # 防止过于频繁
-    # st.rerun() 的逻辑由 Streamlit 的 auto-refresh 处理
 
 
 if __name__ == "__main__":
