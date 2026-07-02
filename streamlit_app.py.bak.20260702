@@ -80,91 +80,30 @@ if 'last_scan_time' not in st.session_state:
 
 @st.cache_data(ttl=30)
 def fetch_index_quotes():
-    """获取三大指数实时行情，带多源回退"""
-    # 尝试东方财富
+    """获取三大指数实时行情"""
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://quote.eastmoney.com/'
-        }
         url = "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f1,f2,f3,f4,f12,f13,f14&secids=1.000001,0.399001,0.399006"
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, timeout=10)
         data = resp.json()
         diffs = data.get('data', {}).get('diff', [])
         result = {}
         for d in diffs:
             code = d.get('f12', '')
             name = d.get('f14', '')
-            price = (d.get('f2', 0) or 0)
-            chg = (d.get('f3', 0) or 0)
+            price = (d.get('f2', 0) or 0) / 100
+            chg = (d.get('f3', 0) or 0) / 100
             result[code] = {'name': name, 'price': price, 'chg': chg}
-        if result:
-            return result
-    except Exception:
-        pass
-
-    # 回退：新浪财经
-    try:
-        url = "https://hq.sinajs.cn/list=sh000001,sz399001,sz399006"
-        headers = {'Referer': 'https://finance.sina.com.cn', 'User-Agent': 'Mozilla/5.0'}
-        resp = requests.get(url, headers=headers, timeout=10)
-        resp.encoding = 'gb2312'
-        result = {}
-        codes = ['000001', '399001', '399006']
-        idx = 0
-        for line in resp.text.split(';'):
-            line = line.strip()
-            if not line or 'var hq_str_' not in line:
-                continue
-            quote = line.split('"')[1]
-            parts = quote.split(',')
-            if len(parts) < 4:
-                continue
-            code = codes[idx] if idx < len(codes) else ''
-            idx += 1
-            name = parts[0]
-            current = float(parts[3]) if parts[3] else 0
-            prev_close = float(parts[2]) if parts[2] else 0
-            chg = ((current - prev_close) / prev_close * 100) if prev_close else 0
-            result[code] = {'name': name, 'price': current, 'chg': chg}
-        if result:
-            return result
-    except Exception:
-        pass
-
-    # 回退：腾讯财经
-    try:
-        url = "https://qt.gtimg.cn/q=sh000001,sz399001,sz399006"
-        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        resp.encoding = 'gb2312'
-        result = {}
-        for line in resp.text.split(';'):
-            line = line.strip()
-            if not line or 'v_sh' not in line and 'v_sz' not in line:
-                continue
-            quote = line.split('"')[1]
-            parts = quote.split('~')
-            if len(parts) < 6:
-                continue
-            code = parts[1]
-            name = parts[0]
-            price = float(parts[2]) if parts[2] else 0
-            chg = float(parts[5]) if parts[5] else 0
-            result[code] = {'name': name, 'price': price, 'chg': chg}
-        if result:
-            return result
-    except Exception:
-        pass
-
-    st.warning("指数数据获取失败: 所有数据源均不可用")
-    return {}
+        return result
+    except Exception as e:
+        st.warning(f"指数数据获取失败: {e}")
+        return {}
 
 @st.cache_data(ttl=60)
 def fetch_alpha_feed_quotes():
     """AlphaFeed 全市场实时行情"""
     try:
         url = f"{AF_BASE}/v1/quotes?universes=CN_Stock"
-        resp = requests.get(url, headers={'X-API-Key': AF_API_KEY, 'User-Agent': 'Mozilla/5.0'}, timeout=30)
+        resp = requests.get(url, headers={'X-API-Key': AF_API_KEY}, timeout=30)
         if resp.status_code != 200:
             return []
         json_data = resp.json()
@@ -217,34 +156,32 @@ def fetch_em_list(board='all', page=1, page_size=100):
         url = (
             f"https://push2.eastmoney.com/api/qt/clist/get"
             f"?pn={page}&pz={page_size}&po=1&np=1&ut=&fltt=2&invt=2&fid=f3"
-            f"&fs={fs}"
+            f"&fs={requests.utils.quote(fs)}"
             f"&fields=f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62"
         )
-        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'}, timeout=15)
+        resp = requests.get(url, timeout=15)
         data = resp.json()
         diffs = data.get('data', {}).get('diff', [])
         if not diffs:
             return []
         results = []
         for d in diffs:
-            f10 = d.get('f10', 0)
-            f10_val = float(f10) if f10 and f10 != '-' else None
             results.append({
                 'code': d.get('f12', ''),
                 'name': d.get('f14', ''),
-                'current': d.get('f2', 0) or 0,
-                'changePercent': d.get('f3', 0) or 0,
-                'change': d.get('f4', 0) or 0,
+                'current': (d.get('f2', 0) or 0) / 100,
+                'changePercent': (d.get('f3', 0) or 0) / 100,
+                'change': (d.get('f4', 0) or 0) / 100,
                 'volume': d.get('f5', 0) or 0,
                 'amount': d.get('f6', 0) or 0,
-                'amplitude': d.get('f7', 0) or 0,
-                'turnover': d.get('f8', 0) or 0,
-                'vol_ratio': f10_val,
-                'open': d.get('f17', 0) or 0,
-                'prevClose': d.get('f18', 0) or 0,
-                'high': d.get('f15', 0) or 0,
-                'low': d.get('f16', 0) or 0,
-                'pe': d.get('f9', 0) or 0,
+                'amplitude': (d.get('f7', 0) or 0) / 100,
+                'turnover': (d.get('f8', 0) or 0) / 100,
+                'vol_ratio': (d.get('f10', 0) or 0) / 100,
+                'open': (d.get('f17', 0) or 0) / 100,
+                'prevClose': (d.get('f18', 0) or 0) / 100,
+                'high': (d.get('f15', 0) or 0) / 100,
+                'low': (d.get('f16', 0) or 0) / 100,
+                'pe': (d.get('f9', 0) or 0) / 100,
                 'float_mktcap': d.get('f21', 0) or 0,
                 'mktcap': d.get('f20', 0) or 0,
                 'sector_flow': (d.get('f62') / 1e4) if d.get('f62') else None,
@@ -274,7 +211,7 @@ def fetch_em_flow_batch(codes: List[str]) -> Dict[str, float]:
             return {}
         secids_str = ','.join(secids[:200])  # 限制批量大小
         url = f"https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f62,f184&secids={secids_str}"
-        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'}, timeout=15)
+        resp = requests.get(url, timeout=15)
         data = resp.json()
         diffs = data.get('data', {}).get('diff', [])
         result = {}
@@ -579,19 +516,20 @@ def run_scan(board: str, min_chg: float, max_chg: float, min_vr: float,
     """执行全市场扫描"""
     progress = st.progress(0, "正在获取全市场数据...")
 
-    # Step 1: 获取全市场行情（东方财富优先，AlphaFeed回退）
-    progress.progress(10, "获取东方财富全市场行情...")
-    all_stocks = []
-    for page in range(1, 8):
-        batch = fetch_em_list(board, page, 100)
-        if not batch:
-            break
-        all_stocks.extend(batch)
-        progress.progress(10 + page * 8, f"获取第{page}页数据...")
+    # Step 1: 获取全市场行情
+    progress.progress(10, "获取AlphaFeed全市场行情...")
+    all_stocks = fetch_alpha_feed_quotes()
 
     if not all_stocks:
-        progress.progress(10, "东方财富不可用，回退到AlphaFeed...")
-        all_stocks = fetch_alpha_feed_quotes()
+        # 回退到东方财富
+        progress.progress(10, "AlphaFeed不可用，回退到东方财富...")
+        all_stocks = []
+        for page in range(1, 6):
+            batch = fetch_em_list(board, page, 100)
+            if not batch:
+                break
+            all_stocks.extend(batch)
+            progress.progress(10 + page * 5, f"获取第{page}页数据...")
 
     if not all_stocks:
         return []
@@ -755,48 +693,42 @@ def render_scan_page():
     if results:
         st.success(f"扫描完成！共找到 {len(results)} 只符合条件的股票")
 
-        # 准备展示数据（无HTML，用于交互式表格）
-        display_rows = []
+        # 转换为DataFrame展示
+        df_data = []
         for i, r in enumerate(results):
+            signals = r.get('signals', [])
+            signal_tags = ''.join([
+                f'<span class="tag-{s["type"]}">{s["label"]}</span> '
+                for s in signals[:3]
+            ])
             chg = r.get('changePercent', 0) or 0
+            chg_class = 'cell-red' if chg >= 0 else 'cell-green'
             flow = r.get('sector_flow')
-            display_rows.append({
+            flow_str = f"{flow/1e4:.2f}亿" if flow else '--'
+
+            df_data.append({
                 '排名': i + 1,
                 '代码': r['code'],
                 '名称': r['name'],
-                '现价': r.get('current', 0) or 0,
-                '涨幅(%)': round(chg, 2),
-                '量比': r.get('vol_ratio') if r.get('vol_ratio') is not None else 0.0,
-                '换手率(%)': r.get('turnover') if r.get('turnover') is not None else 0.0,
-                '成交额(亿)': round((r.get('amount') or 0) / 1e8, 2),
-                '主力净流入(亿)': round(flow / 1e4, 2) if flow else 0.0,
-                '策略信号': ', '.join([s['label'] for s in r.get('signals', [])[:3]]),
+                '现价': r.get('current', '--'),
+                '涨幅': f'<span class="{chg_class}">{chg:+.2f}%</span>',
+                '量比': f"{r.get('vol_ratio', '--'):.2f}" if r.get('vol_ratio') else '--',
+                '换手率': f"{r.get('turnover', '--'):.1f}%" if r.get('turnover') else '--',
+                '成交额': f"{r.get('amount', 0)/1e8:.2f}亿" if r.get('amount') else '--',
+                '主力净流入': flow_str,
+                '策略信号': signal_tags,
                 '评分': r.get('score', 0),
             })
 
-        df = pd.DataFrame(display_rows)
+        df = pd.DataFrame(df_data)
+        st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
-        # 使用交互式表格，点击行查看详情
-        try:
-            event = st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row"
-            )
-            selected_rows = event.selection.rows if event and hasattr(event, 'selection') else []
-            if selected_rows:
-                idx = selected_rows[0]
-                show_stock_detail(results[idx])
-        except Exception as e:
-            # 旧版Streamlit不支持on_select，回退到selectbox
-            st.warning(f"表格交互需要较新版本Streamlit: {e}")
-            stock_names = [f"{r['code']} {r['name']}" for r in results]
-            selected = st.selectbox("选择股票查看详情", stock_names)
-            if selected:
-                idx = stock_names.index(selected)
-                show_stock_detail(results[idx])
+        # 选中股票查看详情
+        stock_names = [f"{r['code']} {r['name']}" for r in results]
+        selected = st.selectbox("选择股票查看详情", stock_names)
+        if selected:
+            idx = stock_names.index(selected)
+            show_stock_detail(results[idx])
     else:
         st.info("点击「开始扫描」启动尾盘选股，建议在 14:00 后使用")
 
